@@ -1,0 +1,18 @@
+[ 
+  { 
+    "offer_id": "offer_1", 
+    "title": "Survey rapide 5 minutes", 
+    "description": "Sondage court, paiement rapide, disponible FR", 
+    "countries": ["FR"], 
+    "devices": ["android", "ios"], 
+    "payout_points": 120 
+  }, 
+  { 
+    "offer_id": "offer_2", 
+    "title": "Installer une app", 
+    "description": "Installe et ouvre l'app 2 minutes, Android uniquement", 
+    "countries": ["FR"], 
+    "devices": ["android"], 
+    "payout_points": 300 
+  } 
+]

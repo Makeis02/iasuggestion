@@ -1,0 +1,5 @@
+[ 
+  {"user_id":"u1","event":"completed","offer_id":"offer_1"}, 
+  {"user_id":"u1","event":"clicked","offer_id":"offer_2"}, 
+  {"user_id":"u1","event":"rejected","offer_id":"offer_3"} 
+]
