@@ -1,40 +1,23 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import asyncio
 import os
 import pickle
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import faiss
-import numpy as np
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sentence_transformers import SentenceTransformer
 
 BASE_DIR = Path(__file__).resolve().parent
 resources: dict = {}
 
 
-async def _warmup_model() -> None:
-    try:
-        model = await asyncio.to_thread(SentenceTransformer, "all-MiniLM-L6-v2")
-        resources["model"] = model
-        resources.pop("model_error", None)
-    except Exception as e:
-        resources["model_error"] = str(e)
-    finally:
-        resources["model_loading"] = False
-
-
 def _supabase_headers() -> dict:
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
     if not key:
-        raise RuntimeError(
-            "Variables d'environnement manquantes: SUPABASE_SERVICE_ROLE_KEY (ou SUPABASE_ANON_KEY)"
-        )
+        raise RuntimeError("Variable d'environnement manquante: SUPABASE_SERVICE_ROLE_KEY")
     return {
         "apikey": key,
         "Authorization": f"Bearer {key}",
@@ -1022,29 +1005,6 @@ async def lifespan(app: FastAPI):
         resources.clear()
         return
 
-    index_path = BASE_DIR / "offers.faiss"
-    meta_path = BASE_DIR / "offers_meta.pkl"
-    if not index_path.exists() or not meta_path.exists():
-        resources["startup_error"] = (
-            f"Fichiers d'index manquants. Lance ingest_offers.py. "
-            f"Attendu: {index_path.name} et {meta_path.name} dans {BASE_DIR}"
-        )
-        yield
-        resources.clear()
-        return
-
-    try:
-        resources["index"] = faiss.read_index(str(index_path))
-        with open(meta_path, "rb") as f:
-            resources["offers_meta"] = pickle.load(f)
-        points = [o.get("points", 0) for o in resources["offers_meta"] if isinstance(o, dict)]
-        max_points = max(points) if points else 1
-        resources["max_points"] = max_points if max_points > 0 else 1
-        resources["model_loading"] = True
-        asyncio.create_task(_warmup_model())
-    except Exception as e:
-        resources["startup_error"] = f"Erreur chargement ressources: {e}"
-
     yield
     resources.clear()
 
@@ -1192,8 +1152,6 @@ def admin_monitoring(request: Request):
         "index_loaded": index_loaded,
         "meta_loaded": meta_loaded,
         "model_loaded": model_loaded,
-        "model_loading": bool(resources.get("model_loading")),
-        "model_error": resources.get("model_error"),
         "index_ntotal": index_ntotal,
         "meta_count": meta_count,
     }
@@ -1212,154 +1170,11 @@ def admin_reindex(request: Request):
 def recommend_offers_internal(
     user_id: str,
     limit: int,
-    device: str | None,
-    country: str | None,
-    mix: dict,
+    country: str | None = None,
+    device: str | None = None,
+    mix: dict | None = None,
 ) -> list[dict]:
-    try:
-        limit_int = max(1, safe_int(limit, 10))
-    except Exception:
-        limit_int = 10
-
-    try:
-        profile_rows = _supabase_get(
-            "profiles",
-            params={"select": "country,device_signup", "id": f"eq.{user_id}", "limit": "1"},
-        )
-    except Exception:
-        profile_rows = []
-
-    profile = profile_rows[0] if profile_rows else {}
-    profile_country = _safe_str(profile.get("country")).strip() or None
-    profile_device = _normalize_device(profile.get("device_signup"))
-
-    effective_country = _safe_str(country).strip() or profile_country
-    effective_device = _normalize_device(device) or profile_device
-
-    try:
-        completed_rows = _supabase_get(
-            "transaction_offers",
-            params={
-                "select": "offer_id,status",
-                "user_id": f"eq.{user_id}",
-                "status": "in.(1)",
-                "limit": "5000",
-            },
-        )
-    except Exception:
-        completed_rows = []
-
-    completed_offer_ids = set()
-    for r in completed_rows:
-        if not isinstance(r, dict):
-            continue
-        if safe_int(r.get("status"), -1) != 1:
-            continue
-        offer_id = r.get("offer_id")
-        if offer_id:
-            completed_offer_ids.add(offer_id)
-
-    try:
-        history_rows = _supabase_get(
-            "transaction_offers",
-            params={
-                "select": "offer_id,offer_name,type,provider,status,created_at",
-                "user_id": f"eq.{user_id}",
-                "status": "in.(0,1)",
-                "order": "created_at.desc",
-                "limit": "50",
-            },
-        )
-    except Exception:
-        history_rows = []
-
-    history_text_parts: list[str] = []
-    for r in history_rows:
-        if not isinstance(r, dict):
-            continue
-        status_val = safe_int(r.get("status"), -1)
-        if status_val not in (0, 1):
-            continue
-        offer_name = _safe_str(r.get("offer_name")).strip()
-        t = _safe_str(r.get("type")).strip()
-        provider = _safe_str(r.get("provider")).strip()
-        part = " ".join([p for p in [offer_name, t, provider] if p])
-        if part:
-            history_text_parts.append(part)
-
-    if history_text_parts:
-        user_profile_text = " ".join(history_text_parts)
-    else:
-        user_profile_text = "nouvel utilisateur rewards: préfère les offres simples et rapides"
-
-    model = resources.get("model")
-    if model is None:
-        raise RuntimeError("Modèle en cours de chargement")
-    query_embedding = model.encode([user_profile_text])
-    query_embedding = np.asarray(query_embedding, dtype=np.float32)
-    faiss.normalize_L2(query_embedding)
-
-    index = resources["index"]
-    top_k = min(50, int(index.ntotal))
-    if top_k <= 0:
-        return []
-
-    D, I = index.search(query_embedding, top_k)
-    offers_meta = resources["offers_meta"]
-    max_points = resources["max_points"]
-
-    surveys_weight = float(mix.get("surveys_weight", 0.5))
-    offers_weight = float(mix.get("offers_weight", 0.5))
-
-    items: list[dict] = []
-    for pos, idx in enumerate(I[0]):
-        if idx == -1:
-            continue
-        if idx >= len(offers_meta):
-            continue
-        offer = offers_meta[idx]
-        if not isinstance(offer, dict):
-            continue
-        offer_id = offer.get("offer_id")
-        if not offer_id:
-            continue
-        if offer_id in completed_offer_ids:
-            continue
-
-        if not _is_device_compatible(offer.get("device_type"), effective_device):
-            continue
-
-        similarity = float(D[0][pos])
-        points = offer.get("points") or 0
-        normalized_payout = (float(points) / float(max_points)) if max_points else 0.0
-        score = similarity + 0.15 * normalized_payout
-
-        if surveys_weight > 0.6:
-            if safe_int(points, 0) <= 10:
-                score -= 0.05
-        elif offers_weight > 0.6:
-            score += 0.10 * float(normalized_payout)
-
-        reason = "Offre populaire et simple"
-        if similarity > 0.6:
-            reason = "Basé sur tes activités récentes"
-        elif normalized_payout > 0.7:
-            reason = "Bon payout"
-
-        items.append(
-            {
-                "offer_id": offer_id,
-                "title": offer.get("title") or "",
-                "payout_points": points,
-                "score": round(float(score), 4),
-                "reason": reason,
-            }
-        )
-        if len(items) >= max(limit_int, 50):
-            break
-
-    items.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
-    return items[:limit_int]
+    return []
 
 
 @app.get("/recommendations/{user_id}")
@@ -1435,8 +1250,6 @@ def get_personalization(
     device: str | None = None,
 ):
     startup_error = resources.get("startup_error")
-    if startup_error:
-        raise HTTPException(status_code=500, detail=startup_error)
 
     try:
         mix = compute_mix(user_id=user_id)
@@ -1468,20 +1281,33 @@ def get_personalization(
     offerwalls_limit = 3
     iframes_limit = 3
 
-    try:
-        offers = recommend_offers_internal(
-            user_id=user_id,
-            limit=offers_limit,
-            device=device,
-            country=country,
-            mix=mix,
-        )
-    except Exception:
-        offers = []
+    offers: list[dict] = []
+    if (not startup_error) and ("index" in resources) and ("offers_meta" in resources):
+        try:
+            offers = recommend_offers_internal(
+                user_id=user_id,
+                limit=offers_limit,
+                device=device,
+                country=country,
+                mix=mix,
+            )
+        except Exception:
+            offers = []
 
-    surveys = recommend_survey_providers(user_id=user_id, limit=surveys_limit, mix=mix)
-    offerwalls = recommend_offerwall_providers(user_id=user_id, limit=offerwalls_limit, mix=mix)
-    iframes = recommend_iframe_providers(user_id=user_id, limit=iframes_limit, mix=mix)
+    try:
+        surveys = recommend_survey_providers(user_id=user_id, limit=surveys_limit, mix=mix)
+    except Exception:
+        surveys = _survey_provider_fallback(surveys_limit)
+
+    try:
+        offerwalls = recommend_offerwall_providers(user_id=user_id, limit=offerwalls_limit, mix=mix)
+    except Exception:
+        offerwalls = _offerwall_provider_fallback(offerwalls_limit)
+
+    try:
+        iframes = recommend_iframe_providers(user_id=user_id, limit=iframes_limit, mix=mix)
+    except Exception:
+        iframes = _iframe_provider_fallback(iframes_limit)
 
     return {
         "user_id": user_id,
