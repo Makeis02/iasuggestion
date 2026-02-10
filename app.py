@@ -1,9 +1,9 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import asyncio
 import os
 import pickle
-import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,23 +18,15 @@ BASE_DIR = Path(__file__).resolve().parent
 resources: dict = {}
 
 
-def _get_model() -> SentenceTransformer:
-    model = resources.get("model")
-    if model is not None:
-        return model
-
-    lock = resources.get("model_lock")
-    if lock is None:
-        lock = threading.Lock()
-        resources["model_lock"] = lock
-
-    with lock:
-        model = resources.get("model")
-        if model is not None:
-            return model
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+async def _warmup_model() -> None:
+    try:
+        model = await asyncio.to_thread(SentenceTransformer, "all-MiniLM-L6-v2")
         resources["model"] = model
-        return model
+        resources.pop("model_error", None)
+    except Exception as e:
+        resources["model_error"] = str(e)
+    finally:
+        resources["model_loading"] = False
 
 
 def _supabase_headers() -> dict:
@@ -1045,10 +1037,11 @@ async def lifespan(app: FastAPI):
         resources["index"] = faiss.read_index(str(index_path))
         with open(meta_path, "rb") as f:
             resources["offers_meta"] = pickle.load(f)
-        resources["model_lock"] = threading.Lock()
         points = [o.get("points", 0) for o in resources["offers_meta"] if isinstance(o, dict)]
         max_points = max(points) if points else 1
         resources["max_points"] = max_points if max_points > 0 else 1
+        resources["model_loading"] = True
+        asyncio.create_task(_warmup_model())
     except Exception as e:
         resources["startup_error"] = f"Erreur chargement ressources: {e}"
 
@@ -1150,7 +1143,7 @@ def _rebuild_index_from_supabase() -> int:
             }
         )
 
-    model = _get_model()
+    model = resources.get("model") or SentenceTransformer("all-MiniLM-L6-v2")
     embeddings = model.encode(texts)
     embeddings = np.asarray(embeddings, dtype=np.float32)
     faiss.normalize_L2(embeddings)
@@ -1187,7 +1180,7 @@ def admin_monitoring(request: Request):
 
     index_loaded = "index" in resources
     meta_loaded = "offers_meta" in resources
-    model_loaded = bool(resources.get("model"))
+    model_loaded = "model" in resources
     index_ntotal = int(resources["index"].ntotal) if index_loaded else 0
     meta_count = len(resources.get("offers_meta", []) or []) if meta_loaded else 0
 
@@ -1199,6 +1192,8 @@ def admin_monitoring(request: Request):
         "index_loaded": index_loaded,
         "meta_loaded": meta_loaded,
         "model_loaded": model_loaded,
+        "model_loading": bool(resources.get("model_loading")),
+        "model_error": resources.get("model_error"),
         "index_ntotal": index_ntotal,
         "meta_count": meta_count,
     }
@@ -1297,7 +1292,9 @@ def recommend_offers_internal(
     else:
         user_profile_text = "nouvel utilisateur rewards: préfère les offres simples et rapides"
 
-    model = _get_model()
+    model = resources.get("model")
+    if model is None:
+        raise RuntimeError("Modèle en cours de chargement")
     query_embedding = model.encode([user_profile_text])
     query_embedding = np.asarray(query_embedding, dtype=np.float32)
     faiss.normalize_L2(query_embedding)
@@ -1523,4 +1520,3 @@ def get_offerwall_provider_recommendations(user_id: str, limit: int = 3):
     except Exception:
         items = _offerwall_provider_fallback(limit)
     return {"user_id": user_id, "items": items}
-
