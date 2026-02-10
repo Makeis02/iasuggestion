@@ -3,6 +3,7 @@ load_dotenv()
 
 import os
 import pickle
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,6 +16,25 @@ from sentence_transformers import SentenceTransformer
 
 BASE_DIR = Path(__file__).resolve().parent
 resources: dict = {}
+
+
+def _get_model() -> SentenceTransformer:
+    model = resources.get("model")
+    if model is not None:
+        return model
+
+    lock = resources.get("model_lock")
+    if lock is None:
+        lock = threading.Lock()
+        resources["model_lock"] = lock
+
+    with lock:
+        model = resources.get("model")
+        if model is not None:
+            return model
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        resources["model"] = model
+        return model
 
 
 def _supabase_headers() -> dict:
@@ -1025,7 +1045,7 @@ async def lifespan(app: FastAPI):
         resources["index"] = faiss.read_index(str(index_path))
         with open(meta_path, "rb") as f:
             resources["offers_meta"] = pickle.load(f)
-        resources["model"] = SentenceTransformer("all-MiniLM-L6-v2")
+        resources["model_lock"] = threading.Lock()
         points = [o.get("points", 0) for o in resources["offers_meta"] if isinstance(o, dict)]
         max_points = max(points) if points else 1
         resources["max_points"] = max_points if max_points > 0 else 1
@@ -1130,7 +1150,7 @@ def _rebuild_index_from_supabase() -> int:
             }
         )
 
-    model = resources.get("model") or SentenceTransformer("all-MiniLM-L6-v2")
+    model = _get_model()
     embeddings = model.encode(texts)
     embeddings = np.asarray(embeddings, dtype=np.float32)
     faiss.normalize_L2(embeddings)
@@ -1167,7 +1187,7 @@ def admin_monitoring(request: Request):
 
     index_loaded = "index" in resources
     meta_loaded = "offers_meta" in resources
-    model_loaded = "model" in resources
+    model_loaded = bool(resources.get("model"))
     index_ntotal = int(resources["index"].ntotal) if index_loaded else 0
     meta_count = len(resources.get("offers_meta", []) or []) if meta_loaded else 0
 
@@ -1277,7 +1297,7 @@ def recommend_offers_internal(
     else:
         user_profile_text = "nouvel utilisateur rewards: préfère les offres simples et rapides"
 
-    model = resources["model"]
+    model = _get_model()
     query_embedding = model.encode([user_profile_text])
     query_embedding = np.asarray(query_embedding, dtype=np.float32)
     faiss.normalize_L2(query_embedding)
@@ -1503,3 +1523,4 @@ def get_offerwall_provider_recommendations(user_id: str, limit: int = 3):
     except Exception:
         items = _offerwall_provider_fallback(limit)
     return {"user_id": user_id, "items": items}
+
