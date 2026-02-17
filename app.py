@@ -127,6 +127,128 @@ def _extract_first_json_object(text: str) -> dict | None:
     return None
 
 
+def _require_internal_token(request: Request) -> None:
+    expected = _safe_str(os.environ.get("IA_INTERNAL_TOKEN")).strip()
+    if not expected:
+        return
+    provided = _safe_str(request.headers.get("x-internal-token") or request.headers.get("X-Internal-Token")).strip()
+    if not provided or provided != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _ollama_chat(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float) -> dict | None:
+    base_url = _safe_str(os.environ.get("OLLAMA_BASE_URL")).strip().rstrip("/")
+    if not base_url:
+        return None
+
+    model = _safe_str(os.environ.get("OLLAMA_MODEL")).strip() or "llama3.1:8b"
+
+    try:
+        resp = requests.post(
+            f"{base_url}/api/chat",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": False,
+                "options": {"temperature": float(temperature), "num_predict": int(max_tokens)},
+            },
+            timeout=60,
+        )
+        if resp.ok:
+            data = resp.json() or {}
+            msg = data.get("message") or {}
+            content = _safe_str(msg.get("content")).strip()
+            if content:
+                return {"content": content, "source": "ollama", "model": model}
+    except Exception:
+        pass
+
+    try:
+        prompt = f"{system_prompt}\n\n{user_prompt}".strip()
+        resp = requests.post(
+            f"{base_url}/api/generate",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "keep_alive": "10m",
+                "options": {"temperature": float(temperature), "num_predict": int(max_tokens)},
+            },
+            timeout=60,
+        )
+        if not resp.ok:
+            return None
+        data = resp.json() or {}
+        content = _safe_str(data.get("response")).strip()
+        if not content:
+            return None
+        return {"content": content, "source": "ollama", "model": model}
+    except Exception:
+        return None
+
+
+def _huggingface_chat(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float) -> dict | None:
+    hf_key = _safe_str(os.environ.get("HUGGINGFACE_API_KEY")).strip()
+    if not hf_key:
+        return None
+
+    model = _safe_str(os.environ.get("HUGGINGFACE_MODEL")).strip() or "HuggingFaceTB/SmolLM3-3B:hf-inference"
+    try:
+        resp = requests.post(
+            "https://router.huggingface.co/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {hf_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": int(max_tokens),
+                "temperature": float(temperature),
+                "stream": False,
+            },
+            timeout=45,
+        )
+        if not resp.ok:
+            return None
+        raw = resp.json() or {}
+        content = ""
+        try:
+            content = _safe_str(((raw.get("choices") or [])[0] or {}).get("message", {}).get("content"))
+        except Exception:
+            content = ""
+        content = _safe_str(content).strip()
+        if not content:
+            return None
+        return {"content": content, "source": "huggingface", "model": model}
+    except Exception:
+        return None
+
+
+def _chat_llm(system_prompt: str, user_prompt: str, max_tokens: int = 220, temperature: float = 0.8) -> dict | None:
+    ollama_first = bool(_safe_str(os.environ.get("OLLAMA_BASE_URL")).strip())
+    if ollama_first:
+        r = _ollama_chat(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=max_tokens, temperature=temperature)
+        if r:
+            return r
+    r = _huggingface_chat(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=max_tokens, temperature=temperature)
+    if r:
+        return r
+    if not ollama_first:
+        r = _ollama_chat(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=max_tokens, temperature=temperature)
+        if r:
+            return r
+    return None
+
+
 def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
@@ -186,11 +308,6 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
 
 
 def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
-    hf_key = _safe_str(os.environ.get("HUGGINGFACE_API_KEY")).strip()
-    if not hf_key:
-        return None
-    model = _safe_str(os.environ.get("HUGGINGFACE_MODEL")).strip() or "HuggingFaceTB/SmolLM3-3B:hf-inference"
-
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
 
@@ -214,36 +331,11 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
         "}"
     )
 
-    resp = requests.post(
-        "https://router.huggingface.co/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {hf_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "max_tokens": 220,
-            "temperature": 0.8,
-            "stream": False,
-        },
-        timeout=35,
-    )
-
-    if not resp.ok:
+    llm = _chat_llm(system_prompt=sys_prompt, user_prompt=user_prompt, max_tokens=220, temperature=0.8)
+    if not llm:
         return None
 
-    raw = resp.json() or {}
-    content = ""
-    try:
-        content = _safe_str(((raw.get("choices") or [])[0] or {}).get("message", {}).get("content"))
-    except Exception:
-        content = ""
-
-    obj = _extract_first_json_object(content)
+    obj = _extract_first_json_object(_safe_str(llm.get("content")))
     if not obj:
         return None
 
@@ -281,9 +373,173 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
         "question": question,
         "answers": answers,
         "points": points,
-        "source": "huggingface",
-        "model": model,
+        "source": _safe_str(llm.get("source")) or "llm",
+        "model": _safe_str(llm.get("model")) or "",
     }
+
+
+def _pick_top_providers(items, limit: int) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    rows = [x for x in items if isinstance(x, dict)]
+    rows.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+    out: list[str] = []
+    for r in rows[: max(0, int(limit))]:
+        p = _safe_str(r.get("provider")).strip().lower()
+        if p:
+            out.append(p)
+    return out
+
+
+def _pick_top_offers(items, limit: int) -> list[dict]:
+    if not isinstance(items, list):
+        return []
+    rows = [x for x in items if isinstance(x, dict)]
+    rows.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+    out: list[dict] = []
+    for r in rows[: max(0, int(limit))]:
+        offer_id = _safe_str(r.get("offer_id")).strip()
+        title = _safe_str(r.get("title")).strip()
+        payout_points = safe_int(r.get("payout_points"), 0)
+        if offer_id or title:
+            out.append({"offer_id": offer_id, "title": title, "payout_points": payout_points})
+    return out
+
+
+def _fallback_notification_message(payload: dict) -> dict:
+    personalization = payload.get("personalization")
+    if not isinstance(personalization, dict):
+        personalization = {}
+    mix = personalization.get("mix")
+    if not isinstance(mix, dict):
+        mix = {}
+    reason = _safe_str(mix.get("reason")).strip() or "balanced"
+    providers = personalization.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    top_surveys = _pick_top_providers((providers.get("surveys") or []), 2)
+    top_offerwalls = _pick_top_providers((providers.get("offerwalls") or []), 1)
+    top_iframes = _pick_top_providers((providers.get("iframes") or []), 1)
+    top_offers = _pick_top_offers((personalization.get("offers") or []), 2)
+
+    target = payload.get("target")
+    if isinstance(target, dict):
+        t_type = _safe_str(target.get("type")).strip().lower()
+        t_title = _safe_str(target.get("title")).strip()
+        t_desc = _safe_str(target.get("description")).strip()
+        t_points = safe_int(target.get("points"), 0)
+        if t_type == "offer" and t_title:
+            body = (t_desc or t_title).replace("\n", " ").strip()
+            if len(body) > 400:
+                body = body[:397] + "..."
+            points_bit = f" • Gagne {t_points} Points" if t_points > 0 else ""
+            return {"kind": "success", "title": f"Offre recommandée : {t_title}", "body": body + points_bit}
+        if t_type == "survey":
+            title = t_title or "Sondage"
+            body = (t_desc or title).replace("\n", " ").strip()
+            if len(body) > 400:
+                body = body[:397] + "..."
+            points_bit = f" • Gagne {t_points} Points" if t_points > 0 else ""
+            return {"kind": "success", "title": f"Sondage recommandé : {title}", "body": body + points_bit}
+
+    if reason == "survey-heavy":
+        body = f"Priorité: {', '.join([s.upper() for s in top_surveys])}." if top_surveys else "On a repéré que tu préfères les sondages en ce moment."
+        return {"kind": "info", "title": "Sondages recommandés aujourd’hui", "body": body}
+
+    if reason == "offer-heavy":
+        if top_offers:
+            body = " • ".join([f"{o.get('title')} (+{o.get('payout_points')})" for o in top_offers if _safe_str(o.get("title")).strip()])
+        else:
+            body = "On a repéré que tu préfères les offres en ce moment."
+        return {"kind": "success", "title": "Offres recommandées aujourd’hui", "body": body or "Offres recommandées aujourd’hui."}
+
+    bits: list[str] = []
+    if top_surveys[:1]:
+        bits.append(f"Sondage: {top_surveys[0].upper()}")
+    if top_offers[:1]:
+        o = top_offers[0]
+        title = _safe_str(o.get("title")).strip()
+        pts = safe_int(o.get("payout_points"), 0)
+        if title:
+            bits.append(f"Offre: {title} (+{pts})" if pts else f"Offre: {title}")
+    if top_offerwalls[:1]:
+        bits.append(f"Offerwall: {top_offerwalls[0].upper()}")
+    if top_iframes[:1]:
+        bits.append(f"Iframe: {top_iframes[0].upper()}")
+    return {
+        "kind": "info",
+        "title": "Suggestions personnalisées",
+        "body": " • ".join(bits) or "Va voir tes offres et sondages recommandés.",
+    }
+
+
+def _generate_notification_message_llm(payload: dict) -> dict | None:
+    personalization = payload.get("personalization")
+    if not isinstance(personalization, dict):
+        personalization = {}
+    mix = personalization.get("mix")
+    if not isinstance(mix, dict):
+        mix = {}
+    reason = _safe_str(mix.get("reason")).strip() or "balanced"
+
+    providers = personalization.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    top_surveys = _pick_top_providers((providers.get("surveys") or []), 2)
+    top_offerwalls = _pick_top_providers((providers.get("offerwalls") or []), 1)
+    top_iframes = _pick_top_providers((providers.get("iframes") or []), 1)
+    top_offers = _pick_top_offers((personalization.get("offers") or []), 2)
+
+    action_url = _safe_str(payload.get("action_url")).strip()
+    target = payload.get("target") if isinstance(payload.get("target"), dict) else {}
+    explore = payload.get("explore") if isinstance(payload.get("explore"), dict) else {}
+
+    sys_prompt = (
+        "Tu écris une notification pour une app de rewards (points, offres, sondages). "
+        "Langue: français. Ton: direct et motivant. "
+        "Réponds UNIQUEMENT en JSON valide, sans texte autour."
+    )
+    user_prompt = (
+        "Génère un message de notification personnalisé pour l'utilisateur.\n"
+        "Contraintes:\n"
+        "- JSON attendu: {\"kind\":\"info|success\",\"title\":\"...\",\"body\":\"...\"}\n"
+        "- title: court (< 60 chars)\n"
+        "- body: court (< 140 chars)\n"
+        "- pas d'emoji\n"
+        "- pas de guillemets inutiles\n\n"
+        f"Décision (reason): {reason}\n"
+        f"Top surveys: {', '.join(top_surveys) if top_surveys else 'none'}\n"
+        f"Top offers: {', '.join([_safe_str(o.get('title')) for o in top_offers if _safe_str(o.get('title')).strip()]) or 'none'}\n"
+        f"Top offerwalls: {', '.join(top_offerwalls) if top_offerwalls else 'none'}\n"
+        f"Top iframes: {', '.join(top_iframes) if top_iframes else 'none'}\n"
+        f"Explore survey_provider: {_safe_str(explore.get('survey_provider')).strip()}\n"
+        f"Explore offer_provider: {_safe_str(explore.get('offer_provider')).strip()}\n"
+        f"Target type: {_safe_str(target.get('type')).strip()}\n"
+        f"Target title: {_safe_str(target.get('title')).strip()}\n"
+        f"Target points: {safe_int(target.get('points'), 0)}\n"
+        f"Action URL: {action_url}\n"
+    )
+
+    llm = _chat_llm(system_prompt=sys_prompt, user_prompt=user_prompt, max_tokens=180, temperature=0.7)
+    if not llm:
+        return None
+
+    obj = _extract_first_json_object(_safe_str(llm.get("content")))
+    if not obj:
+        return None
+
+    kind = _safe_str(obj.get("kind")).strip().lower()
+    if kind not in {"info", "success", "warning", "error"}:
+        kind = "info"
+    title = _safe_str(obj.get("title")).strip()
+    body = _safe_str(obj.get("body")).strip()
+    if not title or not body:
+        return None
+    if len(title) > 80:
+        title = title[:80].rstrip()
+    if len(body) > 220:
+        body = body[:220].rstrip()
+    return {"kind": kind, "title": title, "body": body, "source": _safe_str(llm.get("source")), "model": _safe_str(llm.get("model"))}
 
 
 def normalize_provider(value: str | None) -> str | None:
@@ -1225,25 +1481,68 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
+@app.post("/internal/notification-message")
+async def internal_notification_message(request: Request):
+    _require_internal_token(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if not isinstance(body, dict):
+        body = {}
+
+    payload = {
+        "user_id": body.get("user_id"),
+        "personalization": body.get("personalization") if isinstance(body.get("personalization"), dict) else {},
+        "action_url": body.get("action_url"),
+        "target": body.get("target") if isinstance(body.get("target"), dict) else {},
+        "explore": body.get("explore") if isinstance(body.get("explore"), dict) else {},
+    }
+
+    try:
+        llm = _generate_notification_message_llm(payload)
+    except Exception:
+        llm = None
+
+    if llm and isinstance(llm, dict):
+        return {
+            "kind": _safe_str(llm.get("kind")).strip() or "info",
+            "title": _safe_str(llm.get("title")).strip(),
+            "body": _safe_str(llm.get("body")).strip(),
+            "source": _safe_str(llm.get("source")).strip(),
+            "model": _safe_str(llm.get("model")).strip(),
+        }
+
+    fallback = _fallback_notification_message(payload)
+    return {
+        "kind": _safe_str(fallback.get("kind")).strip() or "info",
+        "title": _safe_str(fallback.get("title")).strip(),
+        "body": _safe_str(fallback.get("body")).strip(),
+        "source": "fallback",
+        "model": "",
+    }
+
 @app.get("/llm-test")
 def llm_test():
     try:
+        base_url = _safe_str(os.environ.get("OLLAMA_BASE_URL")).strip().rstrip("/") or "http://localhost:11434"
+        model = _safe_str(os.environ.get("OLLAMA_MODEL")).strip() or "llama3.1:8b"
         response = requests.post(
-            "http://localhost:11434/api/generate",
+            f"{base_url}/api/generate",
             json={
-                "model": "llama3.1:8b",
+                "model": model,
                 "prompt": "Réponds uniquement: OK",
                 "stream": False,
                 "keep_alive": "10m",
-                "options": {
-                    "num_predict": 20
-                }
+                "options": {"num_predict": 20},
             },
-            timeout=180
+            timeout=180,
         )
         response.raise_for_status()
-        data = response.json()
-        return {"answer": data.get("response", "")}
+        data = response.json() or {}
+        return {"answer": data.get("response", ""), "model": model}
     except requests.Timeout:
         raise HTTPException(status_code=504, detail="Ollama request timed out")
     except requests.RequestException as e:
@@ -1573,4 +1872,3 @@ async def admin_quiz_generate(request: Request):
         return llm
 
     return _fallback_quiz(topic=topic, difficulty=difficulty)
-
