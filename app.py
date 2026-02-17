@@ -3,6 +3,10 @@ load_dotenv()
 
 import os
 import pickle
+import json
+import random
+import re
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,6 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
 resources: dict = {}
+
+
+
+
+
+
 
 
 def _supabase_headers() -> dict:
@@ -80,6 +90,200 @@ def clamp01(value: float) -> float:
     if x > 1.0:
         return 1.0
     return x
+
+
+def _extract_first_json_object(text: str) -> dict | None:
+    s = _safe_str(text).strip()
+    if not s:
+        return None
+
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    try:
+        start = s.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start : i + 1]
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict):
+                        return obj
+                    return None
+    except Exception:
+        return None
+
+    return None
+
+
+def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
+    topic_s = _safe_str(topic).strip() or "culture_generale"
+    diff_s = _safe_str(difficulty).strip().lower() or "medium"
+
+    bank = [
+        {
+            "topic": "culture_generale",
+            "difficulty": "easy",
+            "question": "Quel est le plus grand océan sur Terre ?",
+            "answers": ["océan pacifique", "pacifique"],
+            "points": 15,
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "easy",
+            "question": "Quelle planète est surnommée la planète rouge ?",
+            "answers": ["mars"],
+            "points": 15,
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "medium",
+            "question": "Dans quel pays se trouve la ville de Marrakech ?",
+            "answers": ["maroc", "le maroc"],
+            "points": 25,
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "medium",
+            "question": "Quel est l'auteur de « Les Misérables » ?",
+            "answers": ["victor hugo", "hugo"],
+            "points": 30,
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "hard",
+            "question": "Quelle est la capitale de la Nouvelle-Zélande ?",
+            "answers": ["wellington"],
+            "points": 40,
+        },
+    ]
+
+    candidates = [q for q in bank if q["topic"] == topic_s and q["difficulty"] == diff_s]
+    if not candidates:
+        candidates = [q for q in bank if q["topic"] == topic_s] or bank
+
+    chosen = random.choice(candidates)
+    return {
+        "id": str(uuid.uuid4()),
+        "topic": chosen["topic"],
+        "difficulty": chosen["difficulty"],
+        "question": chosen["question"],
+        "answers": chosen["answers"],
+        "points": chosen["points"],
+        "source": "fallback",
+    }
+
+
+def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
+    hf_key = _safe_str(os.environ.get("HUGGINGFACE_API_KEY")).strip()
+    if not hf_key:
+        return None
+    model = _safe_str(os.environ.get("HUGGINGFACE_MODEL")).strip() or "HuggingFaceTB/SmolLM3-3B:hf-inference"
+
+    topic_s = _safe_str(topic).strip() or "culture_generale"
+    diff_s = _safe_str(difficulty).strip().lower() or "medium"
+
+    sys_prompt = (
+        "Tu génères une question de quiz de culture générale en français. "
+        "Réponds UNIQUEMENT en JSON valide, sans texte autour."
+    )
+    user_prompt = (
+        "Génère une question (une seule) et les réponses acceptées. "
+        "Contraintes:\n"
+        f"- topic: {topic_s}\n"
+        f"- difficulté: {diff_s}\n"
+        "- la question doit être claire et courte\n"
+        "- réponses acceptées: 1 à 4 variantes (minuscules, sans ponctuation)\n"
+        "- points: entier (easy 10-20, medium 20-35, hard 35-60)\n\n"
+        "Format JSON attendu:\n"
+        "{\n"
+        '  "question": "…",\n'
+        '  "answers": ["…"],\n'
+        '  "points": 25\n'
+        "}"
+    )
+
+    resp = requests.post(
+        "https://router.huggingface.co/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {hf_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": 220,
+            "temperature": 0.8,
+            "stream": False,
+        },
+        timeout=35,
+    )
+
+    if not resp.ok:
+        return None
+
+    raw = resp.json() or {}
+    content = ""
+    try:
+        content = _safe_str(((raw.get("choices") or [])[0] or {}).get("message", {}).get("content"))
+    except Exception:
+        content = ""
+
+    obj = _extract_first_json_object(content)
+    if not obj:
+        return None
+
+    question = _safe_str(obj.get("question")).strip()
+    answers_raw = obj.get("answers")
+    points_raw = obj.get("points")
+    if not question:
+        return None
+
+    answers: list[str] = []
+    if isinstance(answers_raw, list):
+        for a in answers_raw[:4]:
+            s = _safe_str(a).strip().lower()
+            s = re.sub(r"\s+", " ", s)
+            if s:
+                answers.append(s)
+    elif isinstance(answers_raw, str):
+        s = _safe_str(answers_raw).strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        if s:
+            answers.append(s)
+    if not answers:
+        return None
+
+    try:
+        points = int(float(points_raw)) if points_raw is not None else 25
+    except Exception:
+        points = 25
+    points = max(1, min(200, points))
+
+    return {
+        "id": str(uuid.uuid4()),
+        "topic": topic_s,
+        "difficulty": diff_s,
+        "question": question,
+        "answers": answers,
+        "points": points,
+        "source": "huggingface",
+        "model": model,
+    }
 
 
 def normalize_provider(value: str | None) -> str | None:
@@ -1346,3 +1550,27 @@ def get_offerwall_provider_recommendations(user_id: str, limit: int = 3):
     except Exception:
         items = _offerwall_provider_fallback(limit)
     return {"user_id": user_id, "items": items}
+
+
+@app.post("/admin/quiz/generate")
+async def admin_quiz_generate(request: Request):
+    _require_admin(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    topic = body.get("topic") if isinstance(body, dict) else None
+    difficulty = body.get("difficulty") if isinstance(body, dict) else None
+
+    try:
+        llm = _generate_quiz_llm(topic=topic, difficulty=difficulty)
+    except Exception:
+        llm = None
+
+    if llm:
+        return llm
+
+    return _fallback_quiz(topic=topic, difficulty=difficulty)
+
