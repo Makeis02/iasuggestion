@@ -1,3 +1,4 @@
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -147,6 +148,7 @@ def _llm_status() -> dict:
         "ollama_base_url": ollama_base_url,
         "ollama_model": ollama_model,
         "huggingface_configured": bool(hf_key),
+        "huggingface_api_key_length": len(hf_key) if hf_key else 0,
         "huggingface_model": hf_model,
     }
 
@@ -2097,4 +2099,3 @@ async def admin_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
-
