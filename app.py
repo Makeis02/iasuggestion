@@ -136,12 +136,27 @@ def _require_internal_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _llm_status() -> dict:
+    ollama_base_url = _safe_str(os.environ.get("OLLAMA_BASE_URL")).strip().rstrip("/")
+    ollama_model = _safe_str(os.environ.get("OLLAMA_MODEL")).strip() or "llama3.1:8b"
+    hf_key = _safe_str(os.environ.get("HUGGINGFACE_API_KEY")).strip()
+    hf_model = _safe_str(os.environ.get("HUGGINGFACE_MODEL")).strip() or "HuggingFaceTB/SmolLM3-3B:hf-inference"
+    return {
+        "ollama_configured": bool(ollama_base_url),
+        "ollama_base_url": ollama_base_url,
+        "ollama_model": ollama_model,
+        "huggingface_configured": bool(hf_key),
+        "huggingface_model": hf_model,
+    }
+
+
 def _ollama_chat(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float) -> dict | None:
     base_url = _safe_str(os.environ.get("OLLAMA_BASE_URL")).strip().rstrip("/")
     if not base_url:
         return None
 
     model = _safe_str(os.environ.get("OLLAMA_MODEL")).strip() or "llama3.1:8b"
+    last_err = ""
 
     try:
         resp = requests.post(
@@ -163,9 +178,12 @@ def _ollama_chat(system_prompt: str, user_prompt: str, max_tokens: int, temperat
             msg = data.get("message") or {}
             content = _safe_str(msg.get("content")).strip()
             if content:
+                resources.pop("last_llm_error", None)
                 return {"content": content, "source": "ollama", "model": model}
+        else:
+            last_err = f"ollama /api/chat HTTP {resp.status_code}: {_safe_str(resp.text)[:240]}"
     except Exception:
-        pass
+        last_err = "ollama /api/chat error"
 
     try:
         prompt = f"{system_prompt}\n\n{user_prompt}".strip()
@@ -182,13 +200,21 @@ def _ollama_chat(system_prompt: str, user_prompt: str, max_tokens: int, temperat
             timeout=60,
         )
         if not resp.ok:
+            last_err = f"ollama /api/generate HTTP {resp.status_code}: {_safe_str(resp.text)[:240]}"
+            resources["last_llm_error"] = last_err
             return None
         data = resp.json() or {}
         content = _safe_str(data.get("response")).strip()
         if not content:
+            last_err = "ollama /api/generate empty response"
+            resources["last_llm_error"] = last_err
             return None
+        resources.pop("last_llm_error", None)
         return {"content": content, "source": "ollama", "model": model}
     except Exception:
+        last_err = "ollama /api/generate error"
+        if last_err:
+            resources["last_llm_error"] = last_err
         return None
 
 
@@ -218,6 +244,7 @@ def _huggingface_chat(system_prompt: str, user_prompt: str, max_tokens: int, tem
             timeout=45,
         )
         if not resp.ok:
+            resources["last_llm_error"] = f"huggingface HTTP {resp.status_code}: {_safe_str(resp.text)[:240]}"
             return None
         raw = resp.json() or {}
         content = ""
@@ -227,14 +254,23 @@ def _huggingface_chat(system_prompt: str, user_prompt: str, max_tokens: int, tem
             content = ""
         content = _safe_str(content).strip()
         if not content:
+            resources["last_llm_error"] = "huggingface empty response"
             return None
+        resources.pop("last_llm_error", None)
         return {"content": content, "source": "huggingface", "model": model}
     except Exception:
+        resources["last_llm_error"] = "huggingface error"
         return None
 
 
 def _chat_llm(system_prompt: str, user_prompt: str, max_tokens: int = 220, temperature: float = 0.8) -> dict | None:
-    ollama_first = bool(_safe_str(os.environ.get("OLLAMA_BASE_URL")).strip())
+    ollama_configured = bool(_safe_str(os.environ.get("OLLAMA_BASE_URL")).strip())
+    hf_configured = bool(_safe_str(os.environ.get("HUGGINGFACE_API_KEY")).strip())
+    if not ollama_configured and not hf_configured:
+        resources["last_llm_error"] = "LLM non configuré (définir HUGGINGFACE_API_KEY ou OLLAMA_BASE_URL)"
+        return None
+
+    ollama_first = ollama_configured
     if ollama_first:
         r = _ollama_chat(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=max_tokens, temperature=temperature)
         if r:
@@ -1657,7 +1693,12 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "startup_error": resources.get("startup_error"),
+        "llm": _llm_status(),
+        "last_llm_error": resources.get("last_llm_error") or "",
+    }
 
 @app.post("/internal/notification-message")
 async def internal_notification_message(request: Request):
@@ -2049,4 +2090,8 @@ async def admin_quiz_generate(request: Request):
     if llm:
         return llm
 
-    return _fallback_quiz(topic=topic, difficulty=difficulty)
+    fallback = _fallback_quiz(topic=topic, difficulty=difficulty)
+    if isinstance(fallback, dict):
+        fallback["llm"] = _llm_status()
+        fallback["llm_error"] = resources.get("last_llm_error") or ""
+    return fallback
