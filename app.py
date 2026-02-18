@@ -253,41 +253,107 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
 
+    points_map = {"easy": 150, "medium": 300, "hard": 500}
+    default_points = points_map.get(diff_s, 300)
+
     bank = [
         {
             "topic": "culture_generale",
             "difficulty": "easy",
             "question": "Quel est le plus grand océan sur Terre ?",
             "answers": ["océan pacifique", "pacifique"],
-            "points": 15,
+            "points": points_map["easy"],
         },
         {
             "topic": "culture_generale",
             "difficulty": "easy",
             "question": "Quelle planète est surnommée la planète rouge ?",
             "answers": ["mars"],
-            "points": 15,
+            "points": points_map["easy"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "easy",
+            "question": "Combien de continents y a-t-il sur Terre ?",
+            "answers": ["7", "sept"],
+            "points": points_map["easy"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "easy",
+            "question": "Quel animal est surnommé le roi de la jungle ?",
+            "answers": ["lion", "le lion"],
+            "points": points_map["easy"],
         },
         {
             "topic": "culture_generale",
             "difficulty": "medium",
             "question": "Dans quel pays se trouve la ville de Marrakech ?",
             "answers": ["maroc", "le maroc"],
-            "points": 25,
+            "points": points_map["medium"],
         },
         {
             "topic": "culture_generale",
             "difficulty": "medium",
             "question": "Quel est l'auteur de « Les Misérables » ?",
             "answers": ["victor hugo", "hugo"],
-            "points": 30,
+            "points": points_map["medium"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "medium",
+            "question": "Quelle est la capitale du Canada ?",
+            "answers": ["ottawa"],
+            "points": points_map["medium"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "medium",
+            "question": "Quel instrument mesure la pression atmosphérique ?",
+            "answers": ["barometre", "baromètre"],
+            "points": points_map["medium"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "medium",
+            "question": "Quel est le fleuve qui traverse Paris ?",
+            "answers": ["seine", "la seine"],
+            "points": points_map["medium"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "medium",
+            "question": "Dans quel pays se trouve la ville de Kyoto ?",
+            "answers": ["japon", "le japon"],
+            "points": points_map["medium"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "medium",
+            "question": "Quel est l'élément chimique dont le symbole est O ?",
+            "answers": ["oxygene", "oxygène"],
+            "points": points_map["medium"],
         },
         {
             "topic": "culture_generale",
             "difficulty": "hard",
             "question": "Quelle est la capitale de la Nouvelle-Zélande ?",
             "answers": ["wellington"],
-            "points": 40,
+            "points": points_map["hard"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "hard",
+            "question": "Quel physicien a formulé les lois du mouvement et la gravitation universelle ?",
+            "answers": ["isaac newton", "newton"],
+            "points": points_map["hard"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "hard",
+            "question": "Dans quel pays se trouve la région du Transylvanie ?",
+            "answers": ["roumanie", "la roumanie"],
+            "points": points_map["hard"],
         },
     ]
 
@@ -295,14 +361,25 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
     if not candidates:
         candidates = [q for q in bank if q["topic"] == topic_s] or bank
 
-    chosen = random.choice(candidates)
+    recent = resources.setdefault("recent_quiz_questions", [])
+    if not isinstance(recent, list):
+        recent = []
+        resources["recent_quiz_questions"] = recent
+    recent_set = {(_safe_str(x).strip()) for x in recent if _safe_str(x).strip()}
+    fresh = [q for q in candidates if _safe_str(q.get("question")).strip() not in recent_set]
+    chosen = random.choice(fresh or candidates)
+    qtxt = _safe_str(chosen.get("question")).strip()
+    if qtxt:
+        recent.append(qtxt)
+        if len(recent) > 25:
+            del recent[:-25]
     return {
         "id": str(uuid.uuid4()),
         "topic": chosen["topic"],
         "difficulty": chosen["difficulty"],
         "question": chosen["question"],
         "answers": chosen["answers"],
-        "points": chosen["points"],
+        "points": safe_int(chosen.get("points"), default_points) or default_points,
         "source": "fallback",
     }
 
@@ -310,38 +387,62 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
 def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
+    points_map = {"easy": 150, "medium": 300, "hard": 500}
+    target_points = points_map.get(diff_s, 300)
 
     sys_prompt = (
         "Tu génères une question de quiz de culture générale en français. "
         "Réponds UNIQUEMENT en JSON valide, sans texte autour."
     )
-    user_prompt = (
-        "Génère une question (une seule) et les réponses acceptées. "
-        "Contraintes:\n"
-        f"- topic: {topic_s}\n"
-        f"- difficulté: {diff_s}\n"
-        "- la question doit être claire et courte\n"
-        "- réponses acceptées: 1 à 4 variantes (minuscules, sans ponctuation)\n"
-        "- points: entier (easy 10-20, medium 20-35, hard 35-60)\n\n"
-        "Format JSON attendu:\n"
-        "{\n"
-        '  "question": "…",\n'
-        '  "answers": ["…"],\n'
-        '  "points": 25\n'
-        "}"
-    )
+    recent = resources.setdefault("recent_quiz_questions", [])
+    if not isinstance(recent, list):
+        recent = []
+        resources["recent_quiz_questions"] = recent
+    recent_set = {(_safe_str(x).strip()) for x in recent if _safe_str(x).strip()}
 
-    llm = _chat_llm(system_prompt=sys_prompt, user_prompt=user_prompt, max_tokens=220, temperature=0.8)
-    if not llm:
-        return None
+    last_questions = [q for q in reversed(recent) if _safe_str(q).strip()][:5]
+    last_questions_txt = "\n".join([f"- {_safe_str(q).strip()}" for q in last_questions if _safe_str(q).strip()])
 
-    obj = _extract_first_json_object(_safe_str(llm.get("content")))
-    if not obj:
-        return None
+    llm = None
+    obj = None
+    question = ""
+    answers_raw = None
+    points_raw = None
+    for _ in range(3):
+        avoid_block = f"\nNe répète pas ces questions:\n{last_questions_txt}\n" if last_questions_txt else "\n"
+        user_prompt = (
+            "Génère une question (une seule) et les réponses acceptées. "
+            "Contraintes:\n"
+            f"- topic: {topic_s}\n"
+            f"- difficulté: {diff_s}\n"
+            "- la question doit être claire et courte\n"
+            "- réponses acceptées: 1 à 4 variantes (minuscules, sans ponctuation)\n"
+            f"- points: entier EXACT ({target_points})\n"
+            f"{avoid_block}\n"
+            "Format JSON attendu:\n"
+            "{\n"
+            '  "question": "…",\n'
+            '  "answers": ["…"],\n'
+            f'  "points": {target_points}\n'
+            "}"
+        )
 
-    question = _safe_str(obj.get("question")).strip()
-    answers_raw = obj.get("answers")
-    points_raw = obj.get("points")
+        llm = _chat_llm(system_prompt=sys_prompt, user_prompt=user_prompt, max_tokens=220, temperature=0.8)
+        if not llm:
+            return None
+
+        obj = _extract_first_json_object(_safe_str(llm.get("content")))
+        if not obj:
+            continue
+
+        question = _safe_str(obj.get("question")).strip()
+        answers_raw = obj.get("answers")
+        points_raw = obj.get("points")
+        if not question:
+            continue
+        if question in recent_set:
+            continue
+        break
     if not question:
         return None
 
@@ -363,8 +464,14 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
     try:
         points = int(float(points_raw)) if points_raw is not None else 25
     except Exception:
-        points = 25
-    points = max(1, min(200, points))
+        points = target_points
+    points = target_points
+
+    qtxt = _safe_str(question).strip()
+    if qtxt:
+        recent.append(qtxt)
+        if len(recent) > 25:
+            del recent[:-25]
 
     return {
         "id": str(uuid.uuid4()),
