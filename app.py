@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
 resources: dict = {}
+SERVICE_VERSION = "2026-02-18-quiz-llm-health-v2"
 
 
 
@@ -1695,6 +1696,7 @@ app.add_middleware(
 def health_check():
     return {
         "status": "ok",
+        "version": SERVICE_VERSION,
         "startup_error": resources.get("startup_error"),
         "llm": _llm_status(),
         "last_llm_error": resources.get("last_llm_error") or "",
@@ -2095,3 +2097,4 @@ async def admin_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
+
