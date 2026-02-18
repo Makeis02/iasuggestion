@@ -253,7 +253,7 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
 
-    points_map = {"easy": 150, "medium": 300, "hard": 500}
+    points_map = {"easy": 150, "medium": 300, "hard": 500, "expert": 800}
     default_points = points_map.get(diff_s, 300)
 
     bank = [
@@ -355,6 +355,69 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
             "answers": ["roumanie", "la roumanie"],
             "points": points_map["hard"],
         },
+        {
+            "topic": "culture_generale",
+            "difficulty": "hard",
+            "question": "Quel traité de 1919 a officiellement mis fin à la Première Guerre mondiale (avec l'Allemagne) ?",
+            "answers": ["traite de versailles", "traité de versailles", "versailles"],
+            "points": points_map["hard"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "hard",
+            "question": "Quel est le nom du processus par lequel une plante convertit l'énergie lumineuse en énergie chimique ?",
+            "answers": ["photosynthese", "photosynthèse"],
+            "points": points_map["hard"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "hard",
+            "question": "Quel est le nom de la mer intérieure située entre l'Europe, l'Asie et l'Afrique ?",
+            "answers": ["mer mediterranee", "mer méditerranée", "mediterranee", "méditerranée"],
+            "points": points_map["hard"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "hard",
+            "question": "Quelle est la particule porteuse de l'interaction électromagnétique ?",
+            "answers": ["photon", "le photon"],
+            "points": points_map["hard"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "expert",
+            "question": "Quel mathématicien a formulé le théorème d'incomplétude (1931) ?",
+            "answers": ["kurt godel", "kurt gödel", "godel", "gödel"],
+            "points": points_map["expert"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "expert",
+            "question": "Dans quelle ville se situe le siège de l'Organisation des Nations unies pour l'éducation, la science et la culture (UNESCO) ?",
+            "answers": ["paris"],
+            "points": points_map["expert"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "expert",
+            "question": "Quel est le nom de l'algorithme de chiffrement symétrique qui a succédé à DES comme standard (2001) ?",
+            "answers": ["aes", "advanced encryption standard", "rijndael"],
+            "points": points_map["expert"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "expert",
+            "question": "Quel est le nom de la métrique cosmologique utilisée dans le modèle standard pour un Univers homogène et isotrope ?",
+            "answers": ["flrw", "friedmann lematre robertson walker", "friedmann-lamaitre-robertson-walker", "friedmann lematre robertson walker"],
+            "points": points_map["expert"],
+        },
+        {
+            "topic": "culture_generale",
+            "difficulty": "expert",
+            "question": "Quel est le nom du principe selon lequel un système quantique ne peut pas être décrit indépendamment de l'appareil de mesure, popularisé par l'école de Copenhague ?",
+            "answers": ["complementarite", "complémentarité", "principe de complementarite", "principe de complémentarité"],
+            "points": points_map["expert"],
+        },
     ]
 
     candidates = [q for q in bank if q["topic"] == topic_s and q["difficulty"] == diff_s]
@@ -387,8 +450,15 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
 def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
-    points_map = {"easy": 150, "medium": 300, "hard": 500}
+    points_map = {"easy": 150, "medium": 300, "hard": 500, "expert": 800}
     target_points = points_map.get(diff_s, 300)
+    difficulty_rules = {
+        "easy": "Niveau easy: question très accessible, connue du grand public, sans piège.",
+        "medium": "Niveau medium: question accessible mais pas triviale, nécessite un minimum de culture générale.",
+        "hard": "Niveau hard: question difficile, évite les évidences (capitale/planète/couleur).",
+        "expert": "Niveau expert: question très difficile et précise, évite les évidences, privilégie histoire/sciences/art/geopolitique.",
+    }
+    rules = difficulty_rules.get(diff_s, difficulty_rules["medium"])
 
     sys_prompt = (
         "Tu génères une question de quiz de culture générale en français. "
@@ -415,6 +485,7 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
             "Contraintes:\n"
             f"- topic: {topic_s}\n"
             f"- difficulté: {diff_s}\n"
+            f"- {rules}\n"
             "- la question doit être claire et courte\n"
             "- réponses acceptées: 1 à 4 variantes (minuscules, sans ponctuation)\n"
             f"- points: entier EXACT ({target_points})\n"
