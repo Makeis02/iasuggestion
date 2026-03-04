@@ -7,6 +7,7 @@ import json
 import random
 import re
 import uuid
+import hashlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -150,6 +151,53 @@ def _llm_status() -> dict:
         "huggingface_api_key_length": len(hf_key) if hf_key else 0,
         "huggingface_model": hf_model,
     }
+
+def _translation_cache_path() -> Path:
+    return BASE_DIR / "translations_cache.json"
+
+def _load_translation_cache() -> dict:
+    try:
+        p = _translation_cache_path()
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                if isinstance(data, dict):
+                    return data
+        return {}
+    except Exception:
+        return {}
+
+def _save_translation_cache(cache: dict) -> None:
+    try:
+        p = _translation_cache_path()
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cache or {}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _cache_key_for_translation(text: str, target_lang: str) -> str:
+    s = _safe_str(text).strip()
+    tl = _safe_str(target_lang).strip().lower() or "fr"
+    h = hashlib.sha256(s.encode("utf-8")).hexdigest()
+    return f"{tl}:{h}"
+
+def _get_cached_translation(text: str, target_lang: str) -> str | None:
+    try:
+        cache = resources.get("translation_cache") or {}
+        key = _cache_key_for_translation(text, target_lang)
+        val = cache.get(key)
+        return _safe_str(val).strip() if val else None
+    except Exception:
+        return None
+
+def _set_cached_translation(text: str, target_lang: str, translated: str) -> None:
+    try:
+        cache = resources.setdefault("translation_cache", {})
+        key = _cache_key_for_translation(text, target_lang)
+        cache[key] = _safe_str(translated).strip()
+        _save_translation_cache(cache)
+    except Exception:
+        pass
 
 
 def _ollama_chat(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float) -> dict | None:
@@ -1675,6 +1723,7 @@ async def lifespan(app: FastAPI):
     try:
         resources["supabase_rest_url"] = _supabase_rest_url()
         resources["supabase_headers"] = _supabase_headers()
+        resources["translation_cache"] = _load_translation_cache()
     except Exception as e:
         resources["startup_error"] = str(e)
         yield
@@ -1702,6 +1751,29 @@ def health_check():
         "llm": _llm_status(),
         "last_llm_error": resources.get("last_llm_error") or "",
     }
+
+@app.post("/translate")
+async def translate(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    text = _safe_str((body or {}).get("text")).strip()
+    target_lang = _safe_str((body or {}).get("target_lang")).strip().lower() or "fr"
+    if not text:
+        return {"translated": ""}
+    cached = _get_cached_translation(text=text, target_lang=target_lang)
+    if cached:
+        return {"translated": cached, "source": "cache", "model": ""}
+    sys_prompt = "Tu traduis un texte en langue cible. Réponds uniquement avec le texte traduit, sans balises ni explications."
+    user_prompt = f"Langue cible: {target_lang}\nTexte:\n{text}"
+    llm = _chat_llm(system_prompt=sys_prompt, user_prompt=user_prompt, max_tokens=600, temperature=0.2)
+    if llm and isinstance(llm, dict):
+        out = _safe_str(llm.get("content")).strip()
+        if out:
+            _set_cached_translation(text=text, target_lang=target_lang, translated=out)
+            return {"translated": out, "source": _safe_str(llm.get("source")), "model": _safe_str(llm.get("model"))}
+    return {"translated": text, "source": "fallback", "model": ""}
 
 @app.post("/internal/notification-message")
 async def internal_notification_message(request: Request):
@@ -2125,3 +2197,4 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
+
