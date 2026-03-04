@@ -208,7 +208,7 @@ def _normalize_for_translation(text: str) -> str:
     # Convert snake_case identifiers to words
     words = re.sub(r"_+", " ", raw).strip()
     # Remove common provider/game prefixes
-    words = re.sub(r"^(se|sr|cg|bp|memo|gratto|shooter|blockpuzzle)\s+", "", words, flags=re.IGNORECASE)
+    words = re.sub(r"^(se|sr|cg|bp|memo|gratto|shooter|blockpuzzle|wf|wild\s*fish)\s+", "", words, flags=re.IGNORECASE)
     # Specific event patterns -> concise English phrases
     m = re.search(r"player\s+reached\s+(\d+)\s+reachlevel", words, flags=re.IGNORECASE)
     if m:
@@ -218,12 +218,71 @@ def _normalize_for_translation(text: str) -> str:
     if m:
         n = m.group(1)
         return f"Reach distance level {n}"
+    m = re.search(r"player\s+reached\s+(\d+)\s+linelevel", words, flags=re.IGNORECASE)
+    if m:
+        n = m.group(1)
+        return f"Reach line level {n}"
     m = re.search(r"reached\s+(\d+)\s+reachlevel", words, flags=re.IGNORECASE)
     if m:
         n = m.group(1)
         return f"Reach level {n}"
+    m = re.search(r"reached\s+(\d+)\s+distancelevel", words, flags=re.IGNORECASE)
+    if m:
+        n = m.group(1)
+        return f"Reach distance level {n}"
+    m = re.search(r"reached\s+(\d+)\s+linelevel", words, flags=re.IGNORECASE)
+    if m:
+        n = m.group(1)
+        return f"Reach line level {n}"
     # Fallback: return cleaned words
     return words
+
+def _deterministic_translate(prepared_text: str, target_lang: str) -> str | None:
+    tl = (_safe_str(target_lang).strip().lower() or "fr")
+    s = _safe_str(prepared_text).strip()
+    if not s:
+        return None
+    # Patterns: "Reach level N", "Reach distance level N", "Reach line level N"
+    m = re.match(r"^reach\s+(level|distance level|line level)\s+(\d+)$", s, flags=re.IGNORECASE)
+    if not m:
+        return None
+    kind = m.group(1).lower()
+    n = m.group(2)
+    templates = {
+        "fr": {
+            "level": "Atteindre le niveau {n}",
+            "distance level": "Atteindre le niveau de distance {n}",
+            "line level": "Atteindre le niveau de ligne {n}",
+        },
+        "de": {
+            "level": "Erreiche Level {n}",
+            "distance level": "Erreiche Distanzlevel {n}",
+            "line level": "Erreiche Linienlevel {n}",
+        },
+        "es": {
+            "level": "Alcanzar nivel {n}",
+            "distance level": "Alcanzar nivel de distancia {n}",
+            "line level": "Alcanzar nivel de línea {n}",
+        },
+        "it": {
+            "level": "Raggiungi il livello {n}",
+            "distance level": "Raggiungi il livello di distanza {n}",
+            "line level": "Raggiungi il livello di linea {n}",
+        },
+        "nl": {
+            "level": "Bereik level {n}",
+            "distance level": "Bereik afstandsniveau {n}",
+            "line level": "Bereik lijnniveau {n}",
+        },
+        "en": {
+            "level": "Reach level {n}",
+            "distance level": "Reach distance level {n}",
+            "line level": "Reach line level {n}",
+        },
+    }
+    lang_templates = templates.get(tl) or templates["en"]
+    template = lang_templates.get(kind) or lang_templates["level"]
+    return template.format(n=n)
 
 def _ollama_chat(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float) -> dict | None:
     base_url = _safe_str(os.environ.get("OLLAMA_BASE_URL")).strip().rstrip("/")
@@ -1810,6 +1869,11 @@ async def translate(request: Request):
         if out:
             _set_cached_translation(text=text, target_lang=target_lang, translated=out)
             return {"translated": out, "source": _safe_str(llm.get("source")), "model": _safe_str(llm.get("model"))}
+    # Deterministic fallback for common task labels
+    det = _deterministic_translate(prepared_text=prepared, target_lang=target_lang)
+    if det:
+        _set_cached_translation(text=text, target_lang=target_lang, translated=det)
+        return {"translated": det, "source": "deterministic", "model": ""}
     return {"translated": text, "source": "fallback", "model": ""}
 
 @app.post("/internal/notification-message")
@@ -2234,4 +2298,3 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
-
