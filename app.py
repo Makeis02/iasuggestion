@@ -57,6 +57,18 @@ def _supabase_get(table: str, params: dict, timeout_s: int = 20) -> list[dict]:
         raise RuntimeError(f"Erreur Supabase {table}: HTTP {resp.status_code} - {resp.text}")
     return resp.json() or []
 
+def _supabase_rpc(func: str, body: dict, timeout_s: int = 20) -> dict:
+    rest_url = resources["supabase_rest_url"]
+    headers = resources["supabase_headers"]
+    resp = requests.post(
+        f"{rest_url}/rpc/{func}",
+        json=body,
+        headers=headers,
+        timeout=timeout_s,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"RPC {func}: HTTP {resp.status_code} - {resp.text}")
+    return resp.json() or {}
 
 def _safe_str(value) -> str:
     if value is None:
@@ -1871,6 +1883,9 @@ async def translate(request: Request):
         body = {}
     text = _safe_str((body or {}).get("text")).strip()
     target_lang = _safe_str((body or {}).get("target_lang")).strip().lower() or "fr"
+    offer_id = _safe_str((body or {}).get("offer_id")).strip()
+    field = _safe_str((body or {}).get("field")).strip() or "text"
+    provider = _safe_str((body or {}).get("provider")).strip()
     if not text:
         return {"translated": ""}
     try:
@@ -1885,6 +1900,25 @@ async def translate(request: Request):
             pass
         return {"translated": cached, "source": "cache", "model": "", "prepared": _normalize_for_translation(text), "reason": "cache_hit"}
     prepared = _normalize_for_translation(text)
+    if offer_id:
+        try:
+            rows = _supabase_get(
+                "offer_translations",
+                {
+                    "select": "translated_text",
+                    "offer_id": f"eq.{offer_id}",
+                    "lang": f"eq.{target_lang}",
+                    "field": f"eq.{field}",
+                    "original_text": f"eq.{text}",
+                    "limit": "1",
+                },
+            )
+            if rows:
+                tt = _safe_str((rows[0] or {}).get("translated_text")).strip()
+                if tt:
+                    return {"translated": tt, "source": "db", "model": "", "prepared": prepared, "reason": "db_hit"}
+        except Exception:
+            pass
     sys_prompt = (
         "Tu es un traducteur pour une app de récompenses mobile (offerwall). "
         "Tu reçois des libellés de tâches et descriptions. "
@@ -1907,6 +1941,23 @@ async def translate(request: Request):
                 print("[IA-TRANSLATE][LLM]", {"lang": target_lang, "prepared": prepared[:120], "output": out[:120], "source": _safe_str(llm.get("source")), "model": _safe_str(llm.get("model"))})
             except Exception:
                 pass
+            if offer_id:
+                try:
+                    _supabase_rpc(
+                        "upsert_offer_translation",
+                        {
+                            "p_offer_id": offer_id,
+                            "p_lang": target_lang,
+                            "p_field": field,
+                            "p_original_text": text,
+                            "p_translated_text": out,
+                            "p_source": _safe_str(llm.get("source")),
+                            "p_model": _safe_str(llm.get("model")),
+                            "p_provider": provider,
+                        },
+                    )
+                except Exception:
+                    pass
             return {"translated": out, "source": _safe_str(llm.get("source")), "model": _safe_str(llm.get("model")), "prepared": prepared, "reason": "llm_success"}
     reason = "llm_empty_or_error"
     llm_err = _safe_str(resources.get("last_llm_error") or "")
