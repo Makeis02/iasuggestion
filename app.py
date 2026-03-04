@@ -361,44 +361,67 @@ def _huggingface_chat(system_prompt: str, user_prompt: str, max_tokens: int, tem
     if not hf_key:
         return None
 
-    model = _safe_str(os.environ.get("HUGGINGFACE_MODEL")).strip() or "HuggingFaceTB/SmolLM3-3B:hf-inference"
-    try:
-        resp = requests.post(
-            "https://router.huggingface.co/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {hf_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "max_tokens": int(max_tokens),
-                "temperature": float(temperature),
-                "stream": False,
-            },
-            timeout=45,
-        )
-        if not resp.ok:
-            resources["last_llm_error"] = f"huggingface HTTP {resp.status_code}: {_safe_str(resp.text)[:240]}"
-            return None
-        raw = resp.json() or {}
-        content = ""
+    configured = _safe_str(os.environ.get("HUGGINGFACE_MODEL")).strip() or "HuggingFaceTB/SmolLM3-3B:hf-inference"
+    fallback_models = [
+        configured,
+        "meta-llama/Meta-Llama-3-8B-Instruct",
+        "mistralai/Mistral-7B-Instruct",
+        "Qwen/Qwen2-7B-Instruct",
+        "HuggingFaceH4/zephyr-7b-beta",
+    ]
+    last_error = ""
+    for model in fallback_models:
         try:
-            content = _safe_str(((raw.get("choices") or [])[0] or {}).get("message", {}).get("content"))
-        except Exception:
+            resp = requests.post(
+                "https://router.huggingface.co/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {hf_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "max_tokens": int(max_tokens),
+                    "temperature": float(temperature),
+                    "stream": False,
+                },
+                timeout=45,
+            )
+            if not resp.ok:
+                last_error = f"huggingface HTTP {resp.status_code}: {_safe_str(resp.text)[:240]}"
+                # Try next fallback if model unsupported/deprecated
+                if resp.status_code in (404, 410):
+                    continue
+                # If router returns structured error with model_no_longer_supported, also continue
+                try:
+                    err_json = resp.json()
+                    code = _safe_str(((err_json.get("error") or {}) or {}).get("code")).strip()
+                    if code == "model_no_longer_supported":
+                        continue
+                except Exception:
+                    pass
+                resources["last_llm_error"] = last_error
+                return None
+            raw = resp.json() or {}
             content = ""
-        content = _safe_str(content).strip()
-        if not content:
-            resources["last_llm_error"] = "huggingface empty response"
-            return None
-        resources.pop("last_llm_error", None)
-        return {"content": content, "source": "huggingface", "model": model}
-    except Exception:
-        resources["last_llm_error"] = "huggingface error"
-        return None
+            try:
+                content = _safe_str(((raw.get("choices") or [])[0] or {}).get("message", {}).get("content"))
+            except Exception:
+                content = ""
+            content = _safe_str(content).strip()
+            if not content:
+                last_error = "huggingface empty response"
+                continue
+            resources.pop("last_llm_error", None)
+            return {"content": content, "source": "huggingface", "model": model}
+        except Exception as e:
+            last_error = f"huggingface error: {e}"
+            continue
+    resources["last_llm_error"] = last_error or "huggingface: all fallback models failed"
+    return None
 
 
 def _chat_llm(system_prompt: str, user_prompt: str, max_tokens: int = 220, temperature: float = 0.8) -> dict | None:
@@ -2317,3 +2340,4 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
+
