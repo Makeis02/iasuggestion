@@ -200,6 +200,31 @@ def _set_cached_translation(text: str, target_lang: str, translated: str) -> Non
         pass
 
 
+def _normalize_for_translation(text: str) -> str:
+    s = _safe_str(text)
+    if not s:
+        return ""
+    raw = s.strip()
+    # Convert snake_case identifiers to words
+    words = re.sub(r"_+", " ", raw).strip()
+    # Remove common provider/game prefixes
+    words = re.sub(r"^(se|sr|cg|bp|memo|gratto|shooter|blockpuzzle)\s+", "", words, flags=re.IGNORECASE)
+    # Specific event patterns -> concise English phrases
+    m = re.search(r"player\s+reached\s+(\d+)\s+reachlevel", words, flags=re.IGNORECASE)
+    if m:
+        n = m.group(1)
+        return f"Reach level {n}"
+    m = re.search(r"player\s+reached\s+(\d+)\s+distancelevel", words, flags=re.IGNORECASE)
+    if m:
+        n = m.group(1)
+        return f"Reach distance level {n}"
+    m = re.search(r"reached\s+(\d+)\s+reachlevel", words, flags=re.IGNORECASE)
+    if m:
+        n = m.group(1)
+        return f"Reach level {n}"
+    # Fallback: return cleaned words
+    return words
+
 def _ollama_chat(system_prompt: str, user_prompt: str, max_tokens: int, temperature: float) -> dict | None:
     base_url = _safe_str(os.environ.get("OLLAMA_BASE_URL")).strip().rstrip("/")
     if not base_url:
@@ -1765,8 +1790,20 @@ async def translate(request: Request):
     cached = _get_cached_translation(text=text, target_lang=target_lang)
     if cached:
         return {"translated": cached, "source": "cache", "model": ""}
-    sys_prompt = "Tu traduis un texte en langue cible. Réponds uniquement avec le texte traduit, sans balises ni explications."
-    user_prompt = f"Langue cible: {target_lang}\nTexte:\n{text}"
+    prepared = _normalize_for_translation(text)
+    sys_prompt = (
+        "Tu es un traducteur pour une app de récompenses mobile (offerwall). "
+        "Tu reçois des libellés de tâches et descriptions. "
+        "Objectif: produire une phrase naturelle et concise dans la langue cible, à l'impératif, sans identifiants techniques. "
+        "Contraintes: "
+        "- Garde les nombres intacts (ex: 150). "
+        "- Pas d'underscore, pas de code, pas d'emoji. "
+        "- Sortie courte (< 60 caractères si possible). "
+        "Exemples: "
+        'Input: "player_reached_150_reachlevel" -> FR: "Atteindre le niveau 150" / DE: "Erreiche Level 150". '
+        'Input: "cg_player_reached_500_distancelevel" -> FR: "Atteindre le niveau de distance 500". '
+    )
+    user_prompt = f"Langue cible: {target_lang}\nTexte:\n{prepared}"
     llm = _chat_llm(system_prompt=sys_prompt, user_prompt=user_prompt, max_tokens=600, temperature=0.2)
     if llm and isinstance(llm, dict):
         out = _safe_str(llm.get("content")).strip()
