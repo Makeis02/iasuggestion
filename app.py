@@ -152,6 +152,10 @@ def _llm_status() -> dict:
         "huggingface_model": hf_model,
     }
 
+def _is_translate_strict() -> bool:
+    v = _safe_str(os.environ.get("TRANSLATE_STRICT")).strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
 def _translation_cache_path() -> Path:
     return BASE_DIR / "translations_cache.json"
 
@@ -1846,9 +1850,17 @@ async def translate(request: Request):
     target_lang = _safe_str((body or {}).get("target_lang")).strip().lower() or "fr"
     if not text:
         return {"translated": ""}
+    try:
+        print("[IA-TRANSLATE][STATUS]", {"llm": _llm_status()})
+    except Exception:
+        pass
     cached = _get_cached_translation(text=text, target_lang=target_lang)
     if cached:
-        return {"translated": cached, "source": "cache", "model": ""}
+        try:
+            print("[IA-TRANSLATE][CACHE]", {"lang": target_lang, "input": text[:120], "output": cached[:120]})
+        except Exception:
+            pass
+        return {"translated": cached, "source": "cache", "model": "", "prepared": _normalize_for_translation(text), "reason": "cache_hit"}
     prepared = _normalize_for_translation(text)
     sys_prompt = (
         "Tu es un traducteur pour une app de récompenses mobile (offerwall). "
@@ -1868,13 +1880,20 @@ async def translate(request: Request):
         out = _safe_str(llm.get("content")).strip()
         if out:
             _set_cached_translation(text=text, target_lang=target_lang, translated=out)
-            return {"translated": out, "source": _safe_str(llm.get("source")), "model": _safe_str(llm.get("model"))}
-    # Deterministic fallback for common task labels
-    det = _deterministic_translate(prepared_text=prepared, target_lang=target_lang)
-    if det:
-        _set_cached_translation(text=text, target_lang=target_lang, translated=det)
-        return {"translated": det, "source": "deterministic", "model": ""}
-    return {"translated": text, "source": "fallback", "model": ""}
+            try:
+                print("[IA-TRANSLATE][LLM]", {"lang": target_lang, "prepared": prepared[:120], "output": out[:120], "source": _safe_str(llm.get("source")), "model": _safe_str(llm.get("model"))})
+            except Exception:
+                pass
+            return {"translated": out, "source": _safe_str(llm.get("source")), "model": _safe_str(llm.get("model")), "prepared": prepared, "reason": "llm_success"}
+    reason = "llm_empty_or_error"
+    llm_err = _safe_str(resources.get("last_llm_error") or "")
+    try:
+        print("[IA-TRANSLATE][FALLBACK]", {"lang": target_lang, "prepared": prepared[:120], "reason": reason, "llm_error": llm_err})
+    except Exception:
+        pass
+    if _is_translate_strict():
+        raise HTTPException(status_code=503, detail={"error": "LLM unavailable or returned empty", "prepared": prepared, "llm_error": llm_err, "llm_status": _llm_status()})
+    return {"translated": text, "source": "fallback", "model": "", "prepared": prepared, "reason": reason, "llm_error": llm_err}
 
 @app.post("/internal/notification-message")
 async def internal_notification_message(request: Request):
