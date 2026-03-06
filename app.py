@@ -2366,8 +2366,28 @@ async def admin_quiz_generate(request: Request):
     return fallback
 
 
+def _calculate_level_from_xp(xp_total: int) -> dict:
+    """
+    Réplique la logique de calcul de niveau du frontend (Profile.tsx).
+    xpForLevel(level) = 50 + (level * 15)
+    """
+    level = 1
+    current_xp = xp_total
+    
+    # Sécurité pour éviter boucle infinie si xp très grand
+    while level < 1000:
+        xp_needed = 50 + (level * 15)
+        if current_xp >= xp_needed:
+            current_xp -= xp_needed
+            level += 1
+        else:
+            break
+            
+    return {"level": level, "current_xp": current_xp, "xp_needed": 50 + (level * 15)}
+
+
 def _get_support_context(user_id: str) -> dict:
-    context = {"user_id": user_id, "points": 0, "level": 0, "xp": 0, "username": "Utilisateur", "transactions": []}
+    context = {"user_id": user_id, "points": 0, "level": 1, "xp": 0, "username": "Utilisateur", "transactions": [], "orders": [], "giftcards_sample": []}
     
     # 1. Récupérer Profil
     try:
@@ -2376,7 +2396,7 @@ def _get_support_context(user_id: str) -> dict:
             "profiles",
             variants=[
                 # Variante 1: Colonnes probables d'après Profile.tsx
-                {"select": "points_total,level,xp,username,full_name", "id": f"eq.{user_id}", "limit": "1"},
+                {"select": "points_total,xp,username,full_name", "id": f"eq.{user_id}", "limit": "1"},
                 # Variante 2: Juste les points et username
                 {"select": "points,username", "id": f"eq.{user_id}", "limit": "1"},
                 # Variante 3: Au moins récupérer quelque chose
@@ -2389,12 +2409,20 @@ def _get_support_context(user_id: str) -> dict:
             p = profiles[0]
             # Gestion flexible des noms de colonnes
             context["points"] = safe_int(p.get("points_total") or p.get("points"), 0)
-            context["level"] = safe_int(p.get("level"), 1)
-            context["xp"] = safe_int(p.get("xp"), 0)
+            
+            # Récupération de l'XP totale brute
+            raw_xp = safe_int(p.get("xp"), 0)
+            
+            # Recalcul du niveau basé sur l'XP totale (comme le frontend)
+            level_info = _calculate_level_from_xp(raw_xp)
+            context["level"] = level_info["level"]
+            context["xp"] = level_info["current_xp"] # XP dans le niveau actuel
+            context["xp_needed"] = level_info["xp_needed"]
+            
             context["username"] = _safe_str(p.get("username") or p.get("full_name") or "Utilisateur").strip()
             
             # Debug log
-            print(f"[SUPPORT-CONTEXT] User found: {context['username']} (Pts: {context['points']})")
+            print(f"[SUPPORT-CONTEXT] User found: {context['username']} (Pts: {context['points']}, XP Total: {raw_xp} -> Lvl {context['level']})")
         else:
              print(f"[SUPPORT-CONTEXT] User NOT found in profiles table: {user_id}")
              
@@ -2458,6 +2486,62 @@ def _get_support_context(user_id: str) -> dict:
                 })
     except Exception as e:
         print(f"[SUPPORT-CONTEXT] Error fetching transactions: {str(e)}")
+
+    # 3. Récupérer Dernières Commandes (Boutique)
+    try:
+        orders_rows = _supabase_get_first_success(
+            "orders",
+            variants=[
+                {
+                    "select": "id,status,created_at,gift_details,cost_points", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "3"
+                }
+            ],
+            timeout_s=5
+        )
+        for row in orders_rows:
+            if isinstance(row, dict):
+                gift_details = row.get("gift_details") or {}
+                name = _safe_str(gift_details.get("name") or "Carte Cadeau")
+                
+                context["orders"].append({
+                    "id": _safe_str(row.get("id")),
+                    "name": name,
+                    "points": safe_int(row.get("cost_points"), 0),
+                    "status": _safe_str(row.get("status")),
+                    "date": _safe_str(row.get("created_at"))
+                })
+    except Exception as e:
+        print(f"[SUPPORT-CONTEXT] Error fetching orders: {str(e)}")
+
+    # 4. Récupérer Échantillon Cartes Cadeaux (Populaires)
+    try:
+        gift_rows = _supabase_get_first_success(
+            "giftcards",
+            variants=[
+                {
+                    "select": "name,brand,points", 
+                    "popular": "eq.true",
+                    "limit": "5"
+                },
+                {
+                    "select": "name,brand,points",
+                    "limit": "5"
+                }
+            ],
+            timeout_s=5
+        )
+        for row in gift_rows:
+            if isinstance(row, dict):
+                context["giftcards_sample"].append({
+                    "name": _safe_str(row.get("name")),
+                    "brand": _safe_str(row.get("brand")),
+                    "points": safe_int(row.get("points"), 0)
+                })
+    except Exception as e:
+        print(f"[SUPPORT-CONTEXT] Error fetching giftcards: {str(e)}")
         
     return context
 
@@ -2484,21 +2568,34 @@ async def support_chat(request: Request):
         ctx = _get_support_context(user_id)
         
         # Construction Prompt
-        tx_summary = "Aucune transaction récente."
+        tx_summary = "Aucune offre récente."
         if ctx["transactions"]:
             lines = []
             for t in ctx["transactions"]:
-                lines.append(f"- {t['date'][:10]}: {t['title']} ({t['provider']}) - {t['status']} - {t['points']} pts")
+                lines.append(f"- [Offre] {t['date'][:10]}: {t['title']} ({t['provider']}) - {t['status']} - {t['points']} pts")
             tx_summary = "\n".join(lines)
             
+        orders_summary = "Aucune commande récente."
+        if ctx["orders"]:
+            lines = []
+            for o in ctx["orders"]:
+                lines.append(f"- [Commande] {o['date'][:10]}: {o['name']} - {o['status']} - Coût: {o['points']} pts")
+            orders_summary = "\n".join(lines)
+            
+        gifts_summary = ""
+        if ctx["giftcards_sample"]:
+            gifts_summary = "Exemples de cartes cadeaux dispos : " + ", ".join([f"{g['name']} ({g['points']} pts)" for g in ctx["giftcards_sample"]])
+            
         system_prompt = (
-            f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n"
-            f"Dernières activités :\n{tx_summary}\n\n"
+            f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n\n"
+            f"Activité Récente :\n{tx_summary}\n\n"
+            f"Commandes Boutique :\n{orders_summary}\n\n"
+            f"Boutique :\n{gifts_summary}\n\n"
             "Règles :\n"
             "1. Sois courtois, empathique et concis.\n"
-            "2. Si l'utilisateur demande où sont ses points, regarde le statut des transactions ci-dessus.\n"
-            "3. Si une offre est 'pending' ou absente, explique que cela peut prendre 24h-48h.\n"
-            "4. Tu ne PEUX PAS créditer de points manuellement.\n"
+            "2. Si l'utilisateur demande où sont ses points d'OFFRE, regarde 'Activité Récente'. Si 'pending', explique le délai (24-48h).\n"
+            "3. Si l'utilisateur demande où est sa COMMANDE (carte cadeau), regarde 'Commandes Boutique'. Si 'pending', dis que c'est en cours de traitement.\n"
+            "4. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
             "5. Si tu ne sais pas, suggère de contacter le support humain.\n"
             "Réponds en français."
         )
