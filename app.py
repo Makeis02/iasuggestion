@@ -2366,6 +2366,109 @@ async def admin_quiz_generate(request: Request):
     return fallback
 
 
+def _get_support_context(user_id: str) -> dict:
+    context = {"user_id": user_id, "points": 0, "level": 0, "transactions": []}
+    
+    # 1. Récupérer Profil
+    try:
+        profiles = _supabase_get_first_success(
+            "profiles",
+            variants=[
+                {"select": "points_total,level,xp,username", "id": f"eq.{user_id}", "limit": "1"},
+            ],
+            timeout_s=10
+        )
+        if profiles:
+            p = profiles[0]
+            context["points"] = safe_int(p.get("points_total"), 0)
+            context["level"] = safe_int(p.get("level"), 1)
+            context["xp"] = safe_int(p.get("xp"), 0)
+            context["username"] = _safe_str(p.get("username"))
+    except Exception:
+        pass
+
+    # 2. Récupérer Dernières Transactions (Offres)
+    try:
+        tx_rows = _supabase_get_first_success(
+            "transaction_offers",
+            variants=[
+                {
+                    "select": "provider,reward_points,status,created_at,title", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "5"
+                }
+            ],
+            timeout_s=10
+        )
+        for row in tx_rows:
+            if isinstance(row, dict):
+                context["transactions"].append({
+                    "type": "offer",
+                    "provider": _safe_str(row.get("provider")),
+                    "points": safe_int(row.get("reward_points"), 0),
+                    "status": _safe_str(row.get("status")),
+                    "date": _safe_str(row.get("created_at")),
+                    "title": _safe_str(row.get("title"))
+                })
+    except Exception:
+        pass
+        
+    return context
+
+
+@app.post("/support/chat")
+async def support_chat(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+        
+    user_id = _safe_str(body.get("user_id")).strip()
+    message = _safe_str(body.get("message")).strip()
+    
+    if not user_id or not message:
+        raise HTTPException(status_code=400, detail="user_id and message required")
+        
+    # Récupération contexte
+    ctx = _get_support_context(user_id)
+    
+    # Construction Prompt
+    tx_summary = "Aucune transaction récente."
+    if ctx["transactions"]:
+        lines = []
+        for t in ctx["transactions"]:
+            lines.append(f"- {t['date'][:10]}: {t['title']} ({t['provider']}) - {t['status']} - {t['points']} pts")
+        tx_summary = "\n".join(lines)
+        
+    system_prompt = (
+        f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n"
+        f"Dernières activités :\n{tx_summary}\n\n"
+        "Règles :\n"
+        "1. Sois courtois, empathique et concis.\n"
+        "2. Si l'utilisateur demande où sont ses points, regarde le statut des transactions ci-dessus.\n"
+        "3. Si une offre est 'pending' ou absente, explique que cela peut prendre 24h-48h.\n"
+        "4. Tu ne PEUX PAS créditer de points manuellement.\n"
+        "5. Si tu ne sais pas, suggère de contacter le support humain.\n"
+        "Réponds en français."
+    )
+    
+    # Appel LLM
+    llm = _chat_llm(system_prompt=system_prompt, user_prompt=message, max_tokens=350, temperature=0.7)
+    
+    if not llm:
+        return {
+            "response": "Je rencontre une difficulté temporaire pour analyser votre demande. Veuillez réessayer dans quelques instants.",
+            "source": "fallback"
+        }
+        
+    return {
+        "response": llm.get("content", ""),
+        "source": llm.get("source", "llm"),
+        "model": llm.get("model", "")
+    }
+
+
 @app.post("/internal/quiz/generate")
 async def internal_quiz_generate(request: Request):
     _require_internal_token(request)
