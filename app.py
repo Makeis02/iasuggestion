@@ -2420,53 +2420,69 @@ def _get_support_context(user_id: str) -> dict:
 @app.post("/support/chat")
 async def support_chat(request: Request):
     try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+            
+        user_id = _safe_str(body.get("user_id")).strip()
+        message = _safe_str(body.get("message")).strip()
         
-    user_id = _safe_str(body.get("user_id")).strip()
-    message = _safe_str(body.get("message")).strip()
-    
-    if not user_id or not message:
-        raise HTTPException(status_code=400, detail="user_id and message required")
+        if not user_id or not message:
+            # Fallback si user_id manque (mode démo ou déconnecté)
+            if message and not user_id:
+                user_id = "anonymous"
+            else:
+                raise HTTPException(status_code=400, detail="user_id and message required")
+            
+        # Récupération contexte
+        ctx = _get_support_context(user_id)
         
-    # Récupération contexte
-    ctx = _get_support_context(user_id)
-    
-    # Construction Prompt
-    tx_summary = "Aucune transaction récente."
-    if ctx["transactions"]:
-        lines = []
-        for t in ctx["transactions"]:
-            lines.append(f"- {t['date'][:10]}: {t['title']} ({t['provider']}) - {t['status']} - {t['points']} pts")
-        tx_summary = "\n".join(lines)
+        # Construction Prompt
+        tx_summary = "Aucune transaction récente."
+        if ctx["transactions"]:
+            lines = []
+            for t in ctx["transactions"]:
+                lines.append(f"- {t['date'][:10]}: {t['title']} ({t['provider']}) - {t['status']} - {t['points']} pts")
+            tx_summary = "\n".join(lines)
+            
+        system_prompt = (
+            f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n"
+            f"Dernières activités :\n{tx_summary}\n\n"
+            "Règles :\n"
+            "1. Sois courtois, empathique et concis.\n"
+            "2. Si l'utilisateur demande où sont ses points, regarde le statut des transactions ci-dessus.\n"
+            "3. Si une offre est 'pending' ou absente, explique que cela peut prendre 24h-48h.\n"
+            "4. Tu ne PEUX PAS créditer de points manuellement.\n"
+            "5. Si tu ne sais pas, suggère de contacter le support humain.\n"
+            "Réponds en français."
+        )
         
-    system_prompt = (
-        f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n"
-        f"Dernières activités :\n{tx_summary}\n\n"
-        "Règles :\n"
-        "1. Sois courtois, empathique et concis.\n"
-        "2. Si l'utilisateur demande où sont ses points, regarde le statut des transactions ci-dessus.\n"
-        "3. Si une offre est 'pending' ou absente, explique que cela peut prendre 24h-48h.\n"
-        "4. Tu ne PEUX PAS créditer de points manuellement.\n"
-        "5. Si tu ne sais pas, suggère de contacter le support humain.\n"
-        "Réponds en français."
-    )
-    
-    # Appel LLM
-    llm = _chat_llm(system_prompt=system_prompt, user_prompt=message, max_tokens=350, temperature=0.7)
-    
-    if not llm:
+        # Appel LLM
+        llm = _chat_llm(system_prompt=system_prompt, user_prompt=message, max_tokens=350, temperature=0.7)
+        
+        if not llm:
+            # Vérifier l'erreur LLM
+            last_error = resources.get("last_llm_error") or "Unknown LLM error"
+            print(f"[SUPPORT-CHAT] LLM Error: {last_error}")
+            return {
+                "response": "Je rencontre une difficulté temporaire pour analyser votre demande. Veuillez réessayer dans quelques instants.",
+                "source": "fallback",
+                "debug_error": last_error
+            }
+            
         return {
-            "response": "Je rencontre une difficulté temporaire pour analyser votre demande. Veuillez réessayer dans quelques instants.",
-            "source": "fallback"
+            "response": llm.get("content", ""),
+            "source": llm.get("source", "llm"),
+            "model": llm.get("model", "")
         }
-        
-    return {
-        "response": llm.get("content", ""),
-        "source": llm.get("source", "llm"),
-        "model": llm.get("model", "")
-    }
+    except Exception as e:
+        print(f"[SUPPORT-CHAT] Exception: {str(e)}")
+        # Renvoyer une réponse valide pour que le frontend l'affiche
+        return {
+            "response": f"Une erreur technique est survenue: {str(e)}",
+            "source": "error"
+        }
 
 
 @app.post("/internal/quiz/generate")
@@ -2494,4 +2510,3 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
-
