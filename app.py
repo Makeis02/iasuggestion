@@ -2367,52 +2367,97 @@ async def admin_quiz_generate(request: Request):
 
 
 def _get_support_context(user_id: str) -> dict:
-    context = {"user_id": user_id, "points": 0, "level": 0, "transactions": []}
+    context = {"user_id": user_id, "points": 0, "level": 0, "xp": 0, "username": "Utilisateur", "transactions": []}
     
     # 1. Récupérer Profil
     try:
+        # Essayer différentes variantes de colonnes au cas où le schéma a changé
         profiles = _supabase_get_first_success(
             "profiles",
             variants=[
-                {"select": "points_total,level,xp,username", "id": f"eq.{user_id}", "limit": "1"},
+                # Variante 1: Colonnes probables d'après Profile.tsx
+                {"select": "points_total,level,xp,username,full_name", "id": f"eq.{user_id}", "limit": "1"},
+                # Variante 2: Juste les points et username
+                {"select": "points,username", "id": f"eq.{user_id}", "limit": "1"},
+                # Variante 3: Au moins récupérer quelque chose
+                {"select": "*", "id": f"eq.{user_id}", "limit": "1"},
             ],
             timeout_s=10
         )
+        
         if profiles:
             p = profiles[0]
-            context["points"] = safe_int(p.get("points_total"), 0)
+            # Gestion flexible des noms de colonnes
+            context["points"] = safe_int(p.get("points_total") or p.get("points"), 0)
             context["level"] = safe_int(p.get("level"), 1)
             context["xp"] = safe_int(p.get("xp"), 0)
-            context["username"] = _safe_str(p.get("username"))
-    except Exception:
-        pass
+            context["username"] = _safe_str(p.get("username") or p.get("full_name") or "Utilisateur").strip()
+            
+            # Debug log
+            print(f"[SUPPORT-CONTEXT] User found: {context['username']} (Pts: {context['points']})")
+        else:
+             print(f"[SUPPORT-CONTEXT] User NOT found in profiles table: {user_id}")
+             
+    except Exception as e:
+        print(f"[SUPPORT-CONTEXT] Error fetching profile: {str(e)}")
 
     # 2. Récupérer Dernières Transactions (Offres)
     try:
-        tx_rows = _supabase_get_first_success(
-            "transaction_offers",
-            variants=[
-                {
-                    "select": "provider,reward_points,status,created_at,title", 
-                    "user_id": f"eq.{user_id}", 
-                    "order": "created_at.desc", 
-                    "limit": "5"
-                }
-            ],
-            timeout_s=10
-        )
+        # Essayer transaction_offers
+        tx_rows = []
+        try:
+            tx_rows = _supabase_get_first_success(
+                "transaction_offers",
+                variants=[
+                    {
+                        "select": "provider,reward_points,status,created_at,title", 
+                        "user_id": f"eq.{user_id}", 
+                        "order": "created_at.desc", 
+                        "limit": "5"
+                    }
+                ],
+                timeout_s=5
+            )
+        except Exception:
+            pass
+            
+        # Essayer transaction_history si transaction_offers vide ou erreur
+        if not tx_rows:
+             try:
+                tx_rows = _supabase_get_first_success(
+                    "transaction_history", # Table hypothétique commune
+                    variants=[
+                        {
+                            "select": "*", 
+                            "user_id": f"eq.{user_id}", 
+                            "order": "created_at.desc", 
+                            "limit": "5"
+                        }
+                    ],
+                    timeout_s=5
+                )
+             except Exception:
+                pass
+
         for row in tx_rows:
             if isinstance(row, dict):
+                # Extraction sécurisée des champs
+                provider = _safe_str(row.get("provider") or row.get("source"))
+                points = safe_int(row.get("reward_points") or row.get("points"), 0)
+                status = _safe_str(row.get("status"))
+                date = _safe_str(row.get("created_at"))
+                title = _safe_str(row.get("title") or row.get("description") or "Action")
+                
                 context["transactions"].append({
                     "type": "offer",
-                    "provider": _safe_str(row.get("provider")),
-                    "points": safe_int(row.get("reward_points"), 0),
-                    "status": _safe_str(row.get("status")),
-                    "date": _safe_str(row.get("created_at")),
-                    "title": _safe_str(row.get("title"))
+                    "provider": provider,
+                    "points": points,
+                    "status": status,
+                    "date": date,
+                    "title": title
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[SUPPORT-CONTEXT] Error fetching transactions: {str(e)}")
         
     return context
 
