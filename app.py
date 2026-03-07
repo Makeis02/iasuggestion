@@ -2644,13 +2644,15 @@ async def support_chat(request: Request):
             return {
                 "response": "Je rencontre une difficulté temporaire pour analyser votre demande. Veuillez réessayer dans quelques instants.",
                 "source": "fallback",
-                "debug_error": last_error
+                "debug_error": last_error,
+                "debug_context": system_prompt
             }
             
         return {
             "response": llm.get("content", ""),
             "source": llm.get("source", "llm"),
-            "model": llm.get("model", "")
+            "model": llm.get("model", ""),
+            "debug_context": system_prompt
         }
     except Exception as e:
         print(f"[SUPPORT-CHAT] Exception: {str(e)}")
