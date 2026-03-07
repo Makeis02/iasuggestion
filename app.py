@@ -2513,21 +2513,16 @@ def _get_support_context(user_id: str) -> dict:
         orders_rows = _supabase_get_first_success(
             "orders",
             variants=[
+                # Variante 1: points_used (Trouvé dans AdminOrders.tsx)
+                {
+                    "select": "id,status,created_at,gift_details,points_used", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "10"
+                },
+                # Variantes de secours
                 {
                     "select": "id,status,created_at,gift_details,cost_points", 
-                    "user_id": f"eq.{user_id}", 
-                    "order": "created_at.desc", 
-                    "limit": "10"
-                },
-                # Variantes de secours pour la colonne coût
-                {
-                    "select": "id,status,created_at,gift_details,cost", 
-                    "user_id": f"eq.{user_id}", 
-                    "order": "created_at.desc", 
-                    "limit": "10"
-                },
-                {
-                    "select": "id,status,created_at,gift_details,points", 
                     "user_id": f"eq.{user_id}", 
                     "order": "created_at.desc", 
                     "limit": "10"
@@ -2542,7 +2537,7 @@ def _get_support_context(user_id: str) -> dict:
                 name = _safe_str(gift_details.get("name") or "Carte Cadeau")
                 
                 # Récupération flexible du coût
-                cost = safe_int(row.get("cost_points") or row.get("cost") or row.get("points"), 0)
+                cost = safe_int(row.get("points_used") or row.get("cost_points") or row.get("points"), 0)
                 
                 context["orders"].append({
                     "id": _safe_str(row.get("id")),
@@ -2561,6 +2556,14 @@ def _get_support_context(user_id: str) -> dict:
         paypal_rows = _supabase_get_first_success(
             "paypal_transfers",
             variants=[
+                # Variante 1: pas de colonne points_cost explicite dans AdminOrders.tsx, on prend juste l'amount
+                {
+                    "select": "id,status,created_at,amount", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "10"
+                },
+                # Variante 2: si points_cost existe
                 {
                     "select": "id,status,created_at,amount,points_cost", 
                     "user_id": f"eq.{user_id}", 
@@ -2575,11 +2578,14 @@ def _get_support_context(user_id: str) -> dict:
             if isinstance(row, dict):
                 amount = safe_int(row.get("amount"), 0)
                 
+                # Estimation du coût en points si non disponible (1€ = ~1000 pts généralement, juste pour info)
+                points = safe_int(row.get("points_cost"), amount * 1000)
+                
                 context["orders"].append({
                     "id": _safe_str(row.get("id")),
                     "type": "Virement PayPal",
                     "name": f"PayPal {amount}€",
-                    "points": safe_int(row.get("points_cost"), 0),
+                    "points": points,
                     "status": _safe_str(row.get("status")),
                     "date": _safe_str(row.get("created_at"))
                 })
@@ -2737,4 +2743,5 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
+
 
