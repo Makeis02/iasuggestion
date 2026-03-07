@@ -2497,7 +2497,7 @@ def _get_support_context(user_id: str) -> dict:
                     "select": "id,status,created_at,gift_details,cost_points", 
                     "user_id": f"eq.{user_id}", 
                     "order": "created_at.desc", 
-                    "limit": "3"
+                    "limit": "10"
                 }
             ],
             timeout_s=5
@@ -2524,7 +2524,7 @@ def _get_support_context(user_id: str) -> dict:
                     "select": "id,status,created_at,amount,points_cost", 
                     "user_id": f"eq.{user_id}", 
                     "order": "created_at.desc", 
-                    "limit": "3"
+                    "limit": "10"
                 }
             ],
             timeout_s=5
@@ -2544,7 +2544,7 @@ def _get_support_context(user_id: str) -> dict:
                 
         # Trier toutes les commandes (PayPal + Cartes) par date
         context["orders"].sort(key=lambda x: x["date"], reverse=True)
-        context["orders"] = context["orders"][:5] # Garder les 5 plus récentes
+        context["orders"] = context["orders"][:10] # Garder les 10 plus récentes
         
     except Exception as e:
         print(f"[SUPPORT-CONTEXT] Error fetching orders/paypal: {str(e)}")
@@ -2612,7 +2612,7 @@ async def support_chat(request: Request):
         if ctx["orders"]:
             lines = []
             for o in ctx["orders"]:
-                lines.append(f"- [Commande] {o['date'][:10]}: {o['name']} - {o['status']} - Coût: {o['points']} pts")
+                lines.append(f"- [Commande] {o['date'][:10]}: {o['name']} ({o['type']}) - {o['status']} - Coût: {o['points']} pts")
             orders_summary = "\n".join(lines)
             
         gifts_summary = ""
@@ -2622,14 +2622,15 @@ async def support_chat(request: Request):
         system_prompt = (
             f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n\n"
             f"Activité Récente :\n{tx_summary}\n\n"
-            f"Commandes Boutique :\n{orders_summary}\n\n"
+            f"Commandes Boutique (Virements & Cartes) :\n{orders_summary}\n\n"
             f"Boutique :\n{gifts_summary}\n\n"
             "Règles :\n"
             "1. Sois courtois, empathique et concis.\n"
             "2. Si l'utilisateur demande où sont ses points d'OFFRE, regarde 'Activité Récente'. Si 'pending', explique le délai (24-48h).\n"
-            "3. Si l'utilisateur demande où est sa COMMANDE (carte cadeau), regarde 'Commandes Boutique'. Si 'pending', dis que c'est en cours de traitement.\n"
-            "4. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
-            "5. Si tu ne sais pas, suggère de contacter le support humain.\n"
+            "3. Si l'utilisateur demande où est sa COMMANDE (carte ou PayPal), regarde 'Commandes Boutique'. Si 'pending', dis que c'est en cours de traitement.\n"
+            "4. Liste TOUJOURS les commandes que tu vois si l'utilisateur demande son historique.\n"
+            "5. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
+            "6. Si tu ne sais pas, suggère de contacter le support humain.\n"
             "Réponds en français."
         )
         
