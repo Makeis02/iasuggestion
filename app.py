@@ -2487,8 +2487,9 @@ def _get_support_context(user_id: str) -> dict:
     except Exception as e:
         print(f"[SUPPORT-CONTEXT] Error fetching transactions: {str(e)}")
 
-    # 3. Récupérer Dernières Commandes (Boutique)
+    # 3. Récupérer Dernières Commandes (Boutique & PayPal)
     try:
+        # Commandes Cartes Cadeaux
         orders_rows = _supabase_get_first_success(
             "orders",
             variants=[
@@ -2508,13 +2509,45 @@ def _get_support_context(user_id: str) -> dict:
                 
                 context["orders"].append({
                     "id": _safe_str(row.get("id")),
+                    "type": "Carte Cadeau",
                     "name": name,
                     "points": safe_int(row.get("cost_points"), 0),
                     "status": _safe_str(row.get("status")),
                     "date": _safe_str(row.get("created_at"))
                 })
+                
+        # Virements PayPal
+        paypal_rows = _supabase_get_first_success(
+            "paypal_transfers",
+            variants=[
+                {
+                    "select": "id,status,created_at,amount,points_cost", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "3"
+                }
+            ],
+            timeout_s=5
+        )
+        for row in paypal_rows:
+            if isinstance(row, dict):
+                amount = safe_int(row.get("amount"), 0)
+                
+                context["orders"].append({
+                    "id": _safe_str(row.get("id")),
+                    "type": "Virement PayPal",
+                    "name": f"PayPal {amount}€",
+                    "points": safe_int(row.get("points_cost"), 0),
+                    "status": _safe_str(row.get("status")),
+                    "date": _safe_str(row.get("created_at"))
+                })
+                
+        # Trier toutes les commandes (PayPal + Cartes) par date
+        context["orders"].sort(key=lambda x: x["date"], reverse=True)
+        context["orders"] = context["orders"][:5] # Garder les 5 plus récentes
+        
     except Exception as e:
-        print(f"[SUPPORT-CONTEXT] Error fetching orders: {str(e)}")
+        print(f"[SUPPORT-CONTEXT] Error fetching orders/paypal: {str(e)}")
 
     # 4. Récupérer Échantillon Cartes Cadeaux (Populaires)
     try:
