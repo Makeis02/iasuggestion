@@ -2387,10 +2387,27 @@ def _calculate_level_from_xp(xp_total: int) -> dict:
 
 
 def _get_support_context(user_id: str) -> dict:
-    context = {"user_id": user_id, "points": 0, "level": 1, "xp": 0, "username": "Utilisateur", "transactions": [], "orders": [], "giftcards_sample": []}
+    context = {
+        "user_id": user_id, 
+        "points": 0, 
+        "level": 1, 
+        "xp": 0, 
+        "username": "Utilisateur", 
+        "transactions": [], 
+        "orders": [], 
+        "giftcards_sample": [],
+        "debug_logs": [] # Nouveaux logs détaillés
+    }
     
+    def log(msg):
+        context["debug_logs"].append(msg)
+        print(f"[SUPPORT-CONTEXT] {msg}")
+
+    log(f"Fetching context for user {user_id}")
+
     # 1. Récupérer Profil
     try:
+        log("Querying 'profiles' table...")
         # Essayer différentes variantes de colonnes au cas où le schéma a changé
         profiles = _supabase_get_first_success(
             "profiles",
@@ -2421,16 +2438,16 @@ def _get_support_context(user_id: str) -> dict:
             
             context["username"] = _safe_str(p.get("username") or p.get("full_name") or "Utilisateur").strip()
             
-            # Debug log
-            print(f"[SUPPORT-CONTEXT] User found: {context['username']} (Pts: {context['points']}, XP Total: {raw_xp} -> Lvl {context['level']})")
+            log(f"User found: {context['username']} (Pts: {context['points']}, XP Total: {raw_xp} -> Lvl {context['level']})")
         else:
-             print(f"[SUPPORT-CONTEXT] User NOT found in profiles table: {user_id}")
+             log(f"User NOT found in profiles table: {user_id}")
              
     except Exception as e:
-        print(f"[SUPPORT-CONTEXT] Error fetching profile: {str(e)}")
+        log(f"Error fetching profile: {str(e)}")
 
     # 2. Récupérer Dernières Transactions (Offres)
     try:
+        log("Querying 'transaction_offers' table...")
         # Essayer transaction_offers
         tx_rows = []
         try:
@@ -2451,6 +2468,7 @@ def _get_support_context(user_id: str) -> dict:
             
         # Essayer transaction_history si transaction_offers vide ou erreur
         if not tx_rows:
+             log("transaction_offers empty or failed, trying 'transaction_history'...")
              try:
                 tx_rows = _supabase_get_first_success(
                     "transaction_history", # Table hypothétique commune
@@ -2466,7 +2484,8 @@ def _get_support_context(user_id: str) -> dict:
                 )
              except Exception:
                 pass
-
+        
+        log(f"Found {len(tx_rows)} transactions.")
         for row in tx_rows:
             if isinstance(row, dict):
                 # Extraction sécurisée des champs
@@ -2485,11 +2504,12 @@ def _get_support_context(user_id: str) -> dict:
                     "title": title
                 })
     except Exception as e:
-        print(f"[SUPPORT-CONTEXT] Error fetching transactions: {str(e)}")
+        log(f"Error fetching transactions: {str(e)}")
 
     # 3. Récupérer Dernières Commandes (Boutique & PayPal)
     try:
         # Commandes Cartes Cadeaux
+        log("Querying 'orders' table (gift cards)...")
         orders_rows = _supabase_get_first_success(
             "orders",
             variants=[
@@ -2502,6 +2522,7 @@ def _get_support_context(user_id: str) -> dict:
             ],
             timeout_s=5
         )
+        log(f"Found {len(orders_rows)} gift card orders.")
         for row in orders_rows:
             if isinstance(row, dict):
                 gift_details = row.get("gift_details") or {}
@@ -2517,6 +2538,7 @@ def _get_support_context(user_id: str) -> dict:
                 })
                 
         # Virements PayPal
+        log("Querying 'paypal_transfers' table...")
         paypal_rows = _supabase_get_first_success(
             "paypal_transfers",
             variants=[
@@ -2529,6 +2551,7 @@ def _get_support_context(user_id: str) -> dict:
             ],
             timeout_s=5
         )
+        log(f"Found {len(paypal_rows)} PayPal transfers.")
         for row in paypal_rows:
             if isinstance(row, dict):
                 amount = safe_int(row.get("amount"), 0)
@@ -2547,10 +2570,11 @@ def _get_support_context(user_id: str) -> dict:
         context["orders"] = context["orders"][:10] # Garder les 10 plus récentes
         
     except Exception as e:
-        print(f"[SUPPORT-CONTEXT] Error fetching orders/paypal: {str(e)}")
+        log(f"Error fetching orders/paypal: {str(e)}")
 
     # 4. Récupérer Échantillon Cartes Cadeaux (Populaires)
     try:
+        log("Querying 'giftcards' table...")
         gift_rows = _supabase_get_first_success(
             "giftcards",
             variants=[
@@ -2574,7 +2598,7 @@ def _get_support_context(user_id: str) -> dict:
                     "points": safe_int(row.get("points"), 0)
                 })
     except Exception as e:
-        print(f"[SUPPORT-CONTEXT] Error fetching giftcards: {str(e)}")
+        log(f"Error fetching giftcards: {str(e)}")
         
     return context
 
@@ -2619,6 +2643,9 @@ async def support_chat(request: Request):
         if ctx["giftcards_sample"]:
             gifts_summary = "Exemples de cartes cadeaux dispos : " + ", ".join([f"{g['name']} ({g['points']} pts)" for g in ctx["giftcards_sample"]])
             
+        # Debug logs pour l'admin
+        debug_logs_str = "\n".join([f"[LOG] {l}" for l in ctx.get("debug_logs", [])])
+            
         system_prompt = (
             f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n\n"
             f"Activité Récente :\n{tx_summary}\n\n"
@@ -2631,7 +2658,8 @@ async def support_chat(request: Request):
             "4. Liste TOUJOURS les commandes que tu vois si l'utilisateur demande son historique.\n"
             "5. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
             "6. Si tu ne sais pas, suggère de contacter le support humain.\n"
-            "Réponds en français."
+            "Réponds en français.\n\n"
+            f"--- DEBUG LOGS (Pour info technique seulement, ne pas citer à l'utilisateur sauf s'il demande des détails techniques) ---\n{debug_logs_str}"
         )
         
         # Appel LLM
@@ -2688,3 +2716,4 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
+
