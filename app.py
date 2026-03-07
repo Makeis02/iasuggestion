@@ -2556,14 +2556,14 @@ def _get_support_context(user_id: str) -> dict:
         paypal_rows = _supabase_get_first_success(
             "paypal_transfers",
             variants=[
-                # Variante 1: pas de colonne points_cost explicite dans AdminOrders.tsx, on prend juste l'amount
+                # Variante 1: 'amount_eur' et 'points_used' (Trouvé dans AdminOrders.tsx)
                 {
-                    "select": "id,status,created_at,amount", 
+                    "select": "id,status,created_at,amount_eur,points_used", 
                     "user_id": f"eq.{user_id}", 
                     "order": "created_at.desc", 
                     "limit": "10"
                 },
-                # Variante 2: si points_cost existe
+                # Variante 2: 'amount' et 'points_cost' (Fallback)
                 {
                     "select": "id,status,created_at,amount,points_cost", 
                     "user_id": f"eq.{user_id}", 
@@ -2576,10 +2576,11 @@ def _get_support_context(user_id: str) -> dict:
         log(f"Found {len(paypal_rows)} PayPal transfers.")
         for row in paypal_rows:
             if isinstance(row, dict):
-                amount = safe_int(row.get("amount"), 0)
+                # Récupération flexible du montant
+                amount = safe_int(row.get("amount_eur") or row.get("amount"), 0)
                 
-                # Estimation du coût en points si non disponible (1€ = ~1000 pts généralement, juste pour info)
-                points = safe_int(row.get("points_cost"), amount * 1000)
+                # Récupération flexible des points
+                points = safe_int(row.get("points_used") or row.get("points_cost"), amount * 1000)
                 
                 context["orders"].append({
                     "id": _safe_str(row.get("id")),
@@ -2685,6 +2686,7 @@ async def support_chat(request: Request):
             "4. Liste TOUJOURS les commandes que tu vois si l'utilisateur demande son historique.\n"
             "5. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
             "6. Si tu ne sais pas, suggère de contacter le support humain.\n"
+            "7. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique sauf si demandé. Ne t'excuse pas excessivement.\n"
             "Réponds en français.\n\n"
             f"--- DEBUG LOGS (Pour info technique seulement, ne pas citer à l'utilisateur sauf s'il demande des détails techniques) ---\n{debug_logs_str}"
         )
@@ -2743,5 +2745,3 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
-
-
