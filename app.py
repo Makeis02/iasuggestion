@@ -2507,14 +2507,27 @@ def _get_support_context(user_id: str) -> dict:
         log(f"Error fetching transactions: {str(e)}")
 
     # 3. Récupérer Dernières Commandes (Boutique & PayPal)
+    # Commandes Cartes Cadeaux
     try:
-        # Commandes Cartes Cadeaux
         log("Querying 'orders' table (gift cards)...")
         orders_rows = _supabase_get_first_success(
             "orders",
             variants=[
                 {
                     "select": "id,status,created_at,gift_details,cost_points", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "10"
+                },
+                # Variantes de secours pour la colonne coût
+                {
+                    "select": "id,status,created_at,gift_details,cost", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "10"
+                },
+                {
+                    "select": "id,status,created_at,gift_details,points", 
                     "user_id": f"eq.{user_id}", 
                     "order": "created_at.desc", 
                     "limit": "10"
@@ -2528,16 +2541,22 @@ def _get_support_context(user_id: str) -> dict:
                 gift_details = row.get("gift_details") or {}
                 name = _safe_str(gift_details.get("name") or "Carte Cadeau")
                 
+                # Récupération flexible du coût
+                cost = safe_int(row.get("cost_points") or row.get("cost") or row.get("points"), 0)
+                
                 context["orders"].append({
                     "id": _safe_str(row.get("id")),
                     "type": "Carte Cadeau",
                     "name": name,
-                    "points": safe_int(row.get("cost_points"), 0),
+                    "points": cost,
                     "status": _safe_str(row.get("status")),
                     "date": _safe_str(row.get("created_at"))
                 })
-                
-        # Virements PayPal
+    except Exception as e:
+        log(f"Error fetching gift card orders: {str(e)}")
+
+    # Virements PayPal
+    try:
         log("Querying 'paypal_transfers' table...")
         paypal_rows = _supabase_get_first_success(
             "paypal_transfers",
@@ -2564,13 +2583,15 @@ def _get_support_context(user_id: str) -> dict:
                     "status": _safe_str(row.get("status")),
                     "date": _safe_str(row.get("created_at"))
                 })
-                
-        # Trier toutes les commandes (PayPal + Cartes) par date
+    except Exception as e:
+        log(f"Error fetching paypal transfers: {str(e)}")
+            
+    # Trier toutes les commandes (PayPal + Cartes) par date
+    try:
         context["orders"].sort(key=lambda x: x["date"], reverse=True)
         context["orders"] = context["orders"][:10] # Garder les 10 plus récentes
-        
-    except Exception as e:
-        log(f"Error fetching orders/paypal: {str(e)}")
+    except Exception:
+        pass
 
     # 4. Récupérer Échantillon Cartes Cadeaux (Populaires)
     try:
