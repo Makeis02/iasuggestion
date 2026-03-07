@@ -2682,11 +2682,12 @@ async def support_chat(request: Request):
             "Règles :\n"
             "1. Sois courtois, empathique et concis.\n"
             "2. Si l'utilisateur demande où sont ses points d'OFFRE, regarde 'Activité Récente'. Si 'pending', explique le délai (24-48h).\n"
-            "3. Si l'utilisateur demande où est sa COMMANDE (carte ou PayPal), regarde 'Commandes Boutique'. Si 'pending', dis que c'est en cours de traitement.\n"
-            "4. Liste TOUJOURS les commandes que tu vois si l'utilisateur demande son historique.\n"
-            "5. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
-            "6. Si tu ne sais pas, suggère de contacter le support humain.\n"
-            "7. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique sauf si demandé. Ne t'excuse pas excessivement.\n"
+            "3. VIREMENTS PAYPAL : Si 'pending', explique que le traitement peut prendre jusqu'à une semaine.\n"
+            "4. CARTES CADEAUX : La livraison est généralement instantanée. Si ce n'est pas le cas (statut 'pending' ou 'processing'), explique que notre prestataire est temporairement en rupture de stock et que le système réessaie automatiquement de passer la commande chaque jour.\n"
+            "5. Liste TOUJOURS les commandes que tu vois si l'utilisateur demande son historique.\n"
+            "6. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
+            "7. Si tu ne sais pas, suggère de contacter le support humain.\n"
+            "8. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique sauf si demandé. Ne t'excuse pas excessivement.\n"
             "Réponds en français.\n\n"
             f"--- DEBUG LOGS (Pour info technique seulement, ne pas citer à l'utilisateur sauf s'il demande des détails techniques) ---\n{debug_logs_str}"
         )
@@ -2745,3 +2746,4 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
+
