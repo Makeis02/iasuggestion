@@ -2920,6 +2920,61 @@ def _get_support_context(user_id: str) -> dict:
     except Exception as e:
         log(f"Error fetching SkyCatcher data: {str(e)}")
         context["skycatcher"] = None
+
+    # 12. Récupérer Historique des Sondages (via transaction_history)
+    try:
+        log("Querying 'transaction_history' for surveys...")
+        survey_rows = _supabase_get_first_success(
+            "transaction_history",
+            variants=[
+                # Variante 1: Filtrer par source contenant 'cpx' ou 'rapido' ou 'survey'
+                {
+                    "select": "source,points,created_at,status", 
+                    "user_id": f"eq.{user_id}", 
+                    "or": "(source.ilike.*cpx*,source.ilike.*rapido*,source.ilike.*survey*)",
+                    "order": "created_at.desc", 
+                    "limit": "5"
+                },
+                # Variante 2: Si le filtre OR échoue, prendre tout et filtrer en Python (moins efficace mais plus sûr)
+                {
+                    "select": "source,points,created_at,status",
+                    "user_id": f"eq.{user_id}",
+                    "order": "created_at.desc",
+                    "limit": "20"
+                }
+            ],
+            timeout_s=5
+        )
+        
+        context["surveys"] = []
+        if survey_rows:
+            for row in survey_rows:
+                if isinstance(row, dict):
+                    source = _safe_str(row.get("source")).lower()
+                    # Filtrage côté Python si la requête SQL large a été utilisée
+                    if "cpx" in source or "rapido" in source or "survey" in source or "sondage" in source:
+                        pts = safe_int(row.get("points"), 0)
+                        date = _safe_str(row.get("created_at"))
+                        status = _safe_str(row.get("status") or "completed")
+                        
+                        # Formatter le nom proprement
+                        provider = "Sondage"
+                        if "cpx" in source: provider = "CPX Research"
+                        elif "rapido" in source: provider = "RapidoReach"
+                        
+                        context["surveys"].append({
+                            "provider": provider,
+                            "points": pts,
+                            "date": date,
+                            "status": status
+                        })
+                        if len(context["surveys"]) >= 5: break # Limite à 5 résultats pertinents
+        
+        log(f"Found {len(context['surveys'])} survey transactions.")
+
+    except Exception as e:
+        log(f"Error fetching survey transactions: {str(e)}")
+        context["surveys"] = []
         
     return context
 
@@ -3030,6 +3085,14 @@ async def support_chat(request: Request):
                     status = "Gagné" if s['won'] else "Perdu"
                     lines.append(f"- [SkyCatcher] {date_str}: {status} - {s['score']} score - {s['points']} pts")
                 skycatcher_summary = "\n".join(lines)
+                
+        surveys_summary = "Aucun sondage récent."
+        if ctx.get("surveys"):
+            lines = []
+            for s in ctx["surveys"]:
+                date_str = s['date'][:10]
+                lines.append(f"- [{s['provider']}] {date_str}: {s['points']} pts ({s['status']})")
+            surveys_summary = "\n".join(lines)
             
         # Debug logs pour l'admin
         debug_logs_str = "\n".join([f"[LOG] {l}" for l in ctx.get("debug_logs", [])])
@@ -3045,6 +3108,7 @@ async def support_chat(request: Request):
             f"Dernières parties Plinko :\n{plinko_summary}\n\n"
             f"Stats Poker Texas Hold'em :\n{poker_summary}\n\n"
             f"Progression SkyCatcher {sky_level_info}:\n{skycatcher_summary}\n\n"
+            f"Derniers Sondages Complétés :\n{surveys_summary}\n\n"
             f"Boutique :\n{gifts_summary}\n\n"
             "Règles :\n"
             "1. Sois courtois, empathique et concis.\n"
@@ -3059,10 +3123,34 @@ async def support_chat(request: Request):
             "10. PLINKO : Si l'utilisateur parle de 'Plinko' ou 'jeu de billes', regarde 'Dernières parties Plinko'. C'est un jeu de chance où on lâche des billes pour gagner des points.\n"
             "11. POKER : Si l'utilisateur parle de 'Poker', regarde 'Stats Poker'. C'est du Texas Hold'em. Mentionne ses gains totaux et son niveau.\n"
             "12. SKYCATCHER : Si l'utilisateur parle de 'SkyCatcher' ou 'jeu d'attrape', regarde 'Progression SkyCatcher'. C'est un jeu où on attrape des objets qui tombent. Mentionne son niveau actuel.\n"
-            "13. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
-            "14. Si tu ne sais pas, suggère de contacter le support humain.\n"
-            "15. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique inutilement. Ne t'excuse pas excessivement.\n"
-            "16. FORMATAGE VISUEL : Utilise des puces (•) pour lister les commandes. Mets les éléments importants en gras (ex: **PayPal 5€**). Ajoute des emojis pertinents (💳, ⏳, ✅, ❌, 🎰, 🧠, 🔫, 🧩, 🎱, 🃏, 🌤️) pour rendre la lecture agréable.\n"
+            "13. SONDAGES & OFFRES :\n"
+            "    - Nous proposons des sondages via **CPX Research** et **RapidoReach**.\n"
+            "    - Pour les offres (murs d'offres), nous travaillons avec **TimeWall**.\n"
+            "    - Si l'utilisateur parle de sondages, regarde 'Derniers Sondages Complétés' pour voir s'il a reçu des points récemment.\n"
+            "    - Si un utilisateur a un problème avec une offre spécifique, conseille-lui de contacter directement le support du mur d'offre concerné (ex: Support TimeWall) car nous n'avons pas la main dessus.\n"
+            "    - RÈGLES GÉNÉRALES SONDAGES :\n"
+            "      • Les sondages dépendent de partenaires externes. Être invité ne garantit pas d'être accepté jusqu'à la fin (disqualification possible si profil non correspondant).\n"
+            "      • Une récompense peut être en attente de validation. Elle peut être annulée en cas de réponse invalide ou frauduleuse.\n"
+            "      • INTERDIT : VPN, proxy, multi-comptes, fausses infos, réponses trop rapides/aléatoires.\n"
+            "      • En cas de souci, demander : date, heure, fournisseur, montant et capture d'écran.\n"
+            "    - RÈGLES CPX RESEARCH :\n"
+            "      • Exige des infos vraies et à jour. Un seul compte par personne/foyer.\n"
+            "      • Refus possible si VPN, réponses rapides ou double inscription.\n"
+            "      • Problème de tracking ? Signaler rapidement (max 7 jours ouvrés).\n"
+            "    - RÈGLES RAPIDOREACH :\n"
+            "      • La disponibilité varie selon le profil et le pays.\n"
+            "      • Les erreurs techniques peuvent venir de l'initialisation ou de l'affichage.\n"
+            "14. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
+            "15. Si tu ne sais pas, suggère de contacter le support humain.\n"
+            "16. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique inutilement.\n"
+            "17. FORMATAGE VISUEL STRICT :\n"
+            "    - Utilise IMPÉRATIVEMENT des sauts de ligne entre chaque élément d'une liste.\n"
+            "    - Utilise des puces (•) pour chaque élément sur une NOUVELLE ligne.\n"
+            "    - Mets les **Noms de Jeux** et **Montants** en GRAS.\n"
+            "    - Utilise des emojis en début de ligne : 🎮 pour les jeux, 💳 pour les commandes, ⏳ pour l'attente, 📋 pour les sondages.\n"
+            "    - Exemple de format attendu :\n"
+            "      • 🎮 **GrattoFolie** : Jeu de grattage...\n"
+            "      • 📋 **Sondage CPX** : Disponible...\n"
             "Réponds en français.\n\n"
             f"--- DEBUG LOGS (Pour info technique seulement, ne pas citer à l'utilisateur sauf s'il demande des détails techniques) ---\n{debug_logs_str}"
         )
