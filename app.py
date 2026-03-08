@@ -2627,6 +2627,299 @@ def _get_support_context(user_id: str) -> dict:
                 })
     except Exception as e:
         log(f"Error fetching giftcards: {str(e)}")
+
+    # 5. Récupérer Stats GrattoFolie (Dernières parties)
+    try:
+        log("Querying 'scratch_results' table (GrattoFolie)...")
+        scratch_rows = _supabase_get_first_success(
+            "scratch_results",
+            variants=[
+                {
+                    "select": "gained_points,scratched_at", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "scratched_at.desc", 
+                    "limit": "5"
+                }
+            ],
+            timeout_s=5
+        )
+        log(f"Found {len(scratch_rows)} scratch results.")
+        
+        context["grattofolie"] = []
+        for row in scratch_rows:
+            if isinstance(row, dict):
+                pts = safe_int(row.get("gained_points"), 0)
+                date = _safe_str(row.get("scratched_at"))
+                context["grattofolie"].append({
+                    "points": pts,
+                    "date": date
+                })
+                
+    except Exception as e:
+        log(f"Error fetching scratch results: {str(e)}")
+        context["grattofolie"] = []
+
+    # 6. Récupérer Stats MemoRush (Dernières parties)
+    try:
+        log("Querying 'memory_game_results' table (MemoRush)...")
+        memo_rows = _supabase_get_first_success(
+            "memory_game_results",
+            variants=[
+                {
+                    "select": "gained_points,moves,time_seconds,created_at", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "5"
+                }
+            ],
+            timeout_s=5
+        )
+        log(f"Found {len(memo_rows)} memorush results.")
+        
+        context["memorush"] = []
+        for row in memo_rows:
+            if isinstance(row, dict):
+                pts = safe_int(row.get("gained_points"), 0)
+                moves = safe_int(row.get("moves"), 0)
+                time_sec = safe_int(row.get("time_seconds"), 0)
+                date = _safe_str(row.get("created_at"))
+                context["memorush"].append({
+                    "points": pts,
+                    "moves": moves,
+                    "time": time_sec,
+                    "date": date
+                })
+                
+    except Exception as e:
+        log(f"Error fetching memorush results: {str(e)}")
+        context["memorush"] = []
+
+    # 7. Récupérer Stats ShooterRush (Progression + Dernières parties)
+    try:
+        log("Querying 'shooter_progress' table...")
+        prog_rows = _supabase_get_first_success(
+            "shooter_progress",
+            variants=[
+                {"select": "current_level,best_level", "user_id": f"eq.{user_id}", "limit": "1"}
+            ],
+            timeout_s=5
+        )
+        
+        shooter_context = {"level": 1, "best_level": 1, "history": []}
+        if prog_rows:
+            p = prog_rows[0]
+            shooter_context["level"] = safe_int(p.get("current_level"), 1)
+            shooter_context["best_level"] = safe_int(p.get("best_level"), 1)
+            
+        log("Querying 'shooterush_results' table...")
+        shooter_results = _supabase_get_first_success(
+            "shooterush_results",
+            variants=[
+                {
+                    "select": "score,points,level,won,created_at", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "5"
+                },
+                # Fallback au cas où la colonne date s'appelle played_at (vu dans le service)
+                {
+                    "select": "score,points,level,won,played_at", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "played_at.desc", 
+                    "limit": "5"
+                }
+            ],
+            timeout_s=5
+        )
+        
+        for row in shooter_results:
+            if isinstance(row, dict):
+                score = safe_int(row.get("score"), 0)
+                points = safe_int(row.get("points"), 0)
+                lvl = safe_int(row.get("level"), 1)
+                won = row.get("won")
+                date = _safe_str(row.get("created_at") or row.get("played_at"))
+                
+                shooter_context["history"].append({
+                    "score": score,
+                    "points": points,
+                    "level": lvl,
+                    "won": won,
+                    "date": date
+                })
+        
+        context["shooterush"] = shooter_context
+        log(f"Found ShooterRush progress: Lvl {shooter_context['level']} (Best: {shooter_context['best_level']}) and {len(shooter_context['history'])} games.")
+
+    except Exception as e:
+        log(f"Error fetching ShooterRush data: {str(e)}")
+        context["shooterush"] = None
+
+    # 8. Récupérer Stats BlockPuzzle (Progression + Dernières parties)
+    try:
+        log("Querying 'block_puzzle_progress' table...")
+        block_prog_rows = _supabase_get_first_success(
+            "block_puzzle_progress",
+            variants=[
+                {"select": "best_score", "user_id": f"eq.{user_id}", "limit": "1"}
+            ],
+            timeout_s=5
+        )
+        
+        block_context = {"best_score": 0, "history": []}
+        if block_prog_rows:
+            p = block_prog_rows[0]
+            block_context["best_score"] = safe_int(p.get("best_score"), 0)
+            
+        log("Querying 'block_puzzle_games' table...")
+        block_results = _supabase_get_first_success(
+            "block_puzzle_games",
+            variants=[
+                {
+                    "select": "score,points_earned,created_at", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "5"
+                }
+            ],
+            timeout_s=5
+        )
+        
+        for row in block_results:
+            if isinstance(row, dict):
+                score = safe_int(row.get("score"), 0)
+                points = safe_int(row.get("points_earned"), 0)
+                date = _safe_str(row.get("created_at"))
+                
+                block_context["history"].append({
+                    "score": score,
+                    "points": points,
+                    "date": date
+                })
+        
+        context["blockpuzzle"] = block_context
+        log(f"Found BlockPuzzle progress: Best Score: {block_context['best_score']} and {len(block_context['history'])} games.")
+
+    except Exception as e:
+        log(f"Error fetching BlockPuzzle data: {str(e)}")
+        context["blockpuzzle"] = None
+
+    # 9. Récupérer Stats Plinko (Dernières parties)
+    try:
+        log("Querying 'plinko_results' table...")
+        plinko_results = _supabase_get_first_success(
+            "plinko_results",
+            variants=[
+                {
+                    "select": "points_won,balls_played,played_at", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "played_at.desc", 
+                    "limit": "5"
+                }
+            ],
+            timeout_s=5
+        )
+        
+        context["plinko"] = []
+        for row in plinko_results:
+            if isinstance(row, dict):
+                pts = safe_int(row.get("points_won"), 0)
+                balls = safe_int(row.get("balls_played"), 1)
+                date = _safe_str(row.get("played_at"))
+                
+                context["plinko"].append({
+                    "points": pts,
+                    "balls": balls,
+                    "date": date
+                })
+        
+        log(f"Found {len(context['plinko'])} Plinko games.")
+
+    except Exception as e:
+        log(f"Error fetching Plinko data: {str(e)}")
+        context["plinko"] = []
+
+    # 10. Récupérer Stats Poker (Progression)
+    try:
+        log("Querying 'poker_progress' table...")
+        poker_prog_rows = _supabase_get_first_success(
+            "poker_progress",
+            variants=[
+                {"select": "level,total_winnings,hands_won,games_played", "user_id": f"eq.{user_id}", "limit": "1"}
+            ],
+            timeout_s=5
+        )
+        
+        context["poker"] = None
+        if poker_prog_rows:
+            p = poker_prog_rows[0]
+            context["poker"] = {
+                "level": safe_int(p.get("level"), 1),
+                "winnings": safe_int(p.get("total_winnings"), 0),
+                "hands_won": safe_int(p.get("hands_won"), 0),
+                "games_played": safe_int(p.get("games_played"), 0)
+            }
+            log(f"Found Poker stats: Lvl {context['poker']['level']}, Winnings: {context['poker']['winnings']}")
+        else:
+            log("No Poker stats found.")
+
+    except Exception as e:
+        log(f"Error fetching Poker data: {str(e)}")
+        context["poker"] = None
+
+    # 11. Récupérer Stats SkyCatcher (Progression + Dernières parties)
+    try:
+        log("Querying 'sky_catcher_progress' table...")
+        sky_prog_rows = _supabase_get_first_success(
+            "sky_catcher_progress",
+            variants=[
+                {"select": "current_level,best_level", "user_id": f"eq.{user_id}", "limit": "1"}
+            ],
+            timeout_s=5
+        )
+        
+        sky_context = {"level": 1, "best_level": 1, "history": []}
+        if sky_prog_rows:
+            p = sky_prog_rows[0]
+            sky_context["level"] = safe_int(p.get("current_level"), 1)
+            sky_context["best_level"] = safe_int(p.get("best_level"), 1)
+            
+        log("Querying 'sky_catcher_results' table...")
+        sky_results = _supabase_get_first_success(
+            "sky_catcher_results",
+            variants=[
+                {
+                    "select": "score,points,level,won,created_at", 
+                    "user_id": f"eq.{user_id}", 
+                    "order": "created_at.desc", 
+                    "limit": "5"
+                }
+            ],
+            timeout_s=5
+        )
+        
+        for row in sky_results:
+            if isinstance(row, dict):
+                score = safe_int(row.get("score"), 0)
+                points = safe_int(row.get("points"), 0)
+                lvl = safe_int(row.get("level"), 1)
+                won = row.get("won")
+                date = _safe_str(row.get("created_at"))
+                
+                sky_context["history"].append({
+                    "score": score,
+                    "points": points,
+                    "level": lvl,
+                    "won": won,
+                    "date": date
+                })
+        
+        context["skycatcher"] = sky_context
+        log(f"Found SkyCatcher progress: Lvl {sky_context['level']} (Best: {sky_context['best_level']}) and {len(sky_context['history'])} games.")
+
+    except Exception as e:
+        log(f"Error fetching SkyCatcher data: {str(e)}")
+        context["skycatcher"] = None
         
     return context
 
@@ -2671,6 +2964,73 @@ async def support_chat(request: Request):
         if ctx["giftcards_sample"]:
             gifts_summary = "Exemples de cartes cadeaux dispos : " + ", ".join([f"{g['name']} ({g['points']} pts)" for g in ctx["giftcards_sample"]])
             
+        grattofolie_summary = "Aucune partie récente."
+        if ctx.get("grattofolie"):
+            lines = []
+            for g in ctx["grattofolie"]:
+                date_str = g['date'][:10]
+                lines.append(f"- [GrattoFolie] {date_str}: {g['points']} pts gagnés")
+            grattofolie_summary = "\n".join(lines)
+            
+        memorush_summary = "Aucune partie récente."
+        if ctx.get("memorush"):
+            lines = []
+            for m in ctx["memorush"]:
+                date_str = m['date'][:10]
+                lines.append(f"- [MemoRush] {date_str}: {m['points']} pts ({m['moves']} coups, {m['time']}s)")
+            memorush_summary = "\n".join(lines)
+            
+        shooterush_summary = "Aucune partie récente."
+        shooter_level_info = ""
+        if ctx.get("shooterush"):
+            shooter_data = ctx["shooterush"]
+            shooter_level_info = f"(Niveau actuel: {shooter_data['level']}, Record: {shooter_data['best_level']})"
+            if shooter_data.get("history"):
+                lines = []
+                for s in shooter_data["history"]:
+                    date_str = s['date'][:10]
+                    status = "Gagné" if s['won'] else "Perdu"
+                    lines.append(f"- [ShooterRush] {date_str}: {status} - {s['score']} score - {s['points']} pts")
+                shooterush_summary = "\n".join(lines)
+                
+        blockpuzzle_summary = "Aucune partie récente."
+        block_best_score = ""
+        if ctx.get("blockpuzzle"):
+            block_data = ctx["blockpuzzle"]
+            block_best_score = f"(Record: {block_data['best_score']})"
+            if block_data.get("history"):
+                lines = []
+                for b in block_data["history"]:
+                    date_str = b['date'][:10]
+                    lines.append(f"- [BlockPuzzle] {date_str}: {b['score']} score - {b['points']} pts")
+                blockpuzzle_summary = "\n".join(lines)
+                
+        plinko_summary = "Aucune partie récente."
+        if ctx.get("plinko"):
+            lines = []
+            for p in ctx["plinko"]:
+                date_str = p['date'][:10]
+                lines.append(f"- [Plinko] {date_str}: {p['points']} pts ({p['balls']} billes)")
+            plinko_summary = "\n".join(lines)
+            
+        poker_summary = "Aucune donnée de Poker."
+        if ctx.get("poker"):
+            p = ctx["poker"]
+            poker_summary = f"Niveau: {p['level']}, Gains totaux: {p['winnings']} pts, Mains gagnées: {p['hands_won']}, Parties jouées: {p['games_played']}"
+            
+        skycatcher_summary = "Aucune partie récente."
+        sky_level_info = ""
+        if ctx.get("skycatcher"):
+            sky_data = ctx["skycatcher"]
+            sky_level_info = f"(Niveau actuel: {sky_data['level']}, Record: {sky_data['best_level']})"
+            if sky_data.get("history"):
+                lines = []
+                for s in sky_data["history"]:
+                    date_str = s['date'][:10]
+                    status = "Gagné" if s['won'] else "Perdu"
+                    lines.append(f"- [SkyCatcher] {date_str}: {status} - {s['score']} score - {s['points']} pts")
+                skycatcher_summary = "\n".join(lines)
+            
         # Debug logs pour l'admin
         debug_logs_str = "\n".join([f"[LOG] {l}" for l in ctx.get("debug_logs", [])])
             
@@ -2678,6 +3038,13 @@ async def support_chat(request: Request):
             f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n\n"
             f"Activité Récente :\n{tx_summary}\n\n"
             f"Commandes Boutique (Virements & Cartes) :\n{orders_summary}\n\n"
+            f"Dernières parties GrattoFolie :\n{grattofolie_summary}\n\n"
+            f"Dernières parties MemoRush :\n{memorush_summary}\n\n"
+            f"Progression ShooterRush {shooter_level_info}:\n{shooterush_summary}\n\n"
+            f"Progression BlockPuzzle {block_best_score}:\n{blockpuzzle_summary}\n\n"
+            f"Dernières parties Plinko :\n{plinko_summary}\n\n"
+            f"Stats Poker Texas Hold'em :\n{poker_summary}\n\n"
+            f"Progression SkyCatcher {sky_level_info}:\n{skycatcher_summary}\n\n"
             f"Boutique :\n{gifts_summary}\n\n"
             "Règles :\n"
             "1. Sois courtois, empathique et concis.\n"
@@ -2685,10 +3052,17 @@ async def support_chat(request: Request):
             "3. VIREMENTS PAYPAL : Si 'pending', explique que le traitement peut prendre jusqu'à une semaine.\n"
             "4. CARTES CADEAUX : La livraison est généralement instantanée. Si ce n'est pas le cas (statut 'pending' ou 'processing'), explique que notre prestataire est temporairement en rupture de stock et que le système réessaie automatiquement de passer la commande chaque jour.\n"
             "5. SI L'UTILISATEUR PARLE DE COMMANDES EN COURS/NON REÇUES : Ne liste QUE les commandes avec le statut 'pending', 'processing' ou 'disputed'. Ignore les commandes 'delivered' ou 'cancelled' sauf si l'utilisateur demande explicitement l'historique complet.\n"
-            "6. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
-            "7. Si tu ne sais pas, suggère de contacter le support humain.\n"
-            "8. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique inutilement. Ne t'excuse pas excessivement.\n"
-            "9. FORMATAGE VISUEL : Utilise des puces (•) pour lister les commandes. Mets les éléments importants en gras (ex: **PayPal 5€**). Ajoute des emojis pertinents (💳, ⏳, ✅, ❌) pour rendre la lecture agréable.\n"
+            "6. GRATTOFOLIE : Si l'utilisateur demande s'il a gagné récemment à GrattoFolie, regarde 'Dernières parties GrattoFolie'. Explique que c'est un jeu de grattage quotidien.\n"
+            "7. MEMORUSH : Si l'utilisateur parle de 'jeu de mémoire' ou 'MemoRush', regarde 'Dernières parties MemoRush'. C'est un jeu où il faut trouver les paires de cartes.\n"
+            "8. SHOOTERRUSH : Si l'utilisateur parle de 'jeu de tir', 'ShooterRush' ou 'Shooter', regarde 'Progression ShooterRush'. C'est un jeu d'arcade où il faut détruire des ennemis. Mentionne son niveau actuel et son meilleur niveau s'il demande sa progression.\n"
+            "9. BLOCKPUZZLE : Si l'utilisateur parle de 'BlockPuzzle' ou 'jeu de blocs' (style Tetris), regarde 'Progression BlockPuzzle'. C'est un jeu de réflexion. Mentionne son record de score.\n"
+            "10. PLINKO : Si l'utilisateur parle de 'Plinko' ou 'jeu de billes', regarde 'Dernières parties Plinko'. C'est un jeu de chance où on lâche des billes pour gagner des points.\n"
+            "11. POKER : Si l'utilisateur parle de 'Poker', regarde 'Stats Poker'. C'est du Texas Hold'em. Mentionne ses gains totaux et son niveau.\n"
+            "12. SKYCATCHER : Si l'utilisateur parle de 'SkyCatcher' ou 'jeu d'attrape', regarde 'Progression SkyCatcher'. C'est un jeu où on attrape des objets qui tombent. Mentionne son niveau actuel.\n"
+            "13. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
+            "14. Si tu ne sais pas, suggère de contacter le support humain.\n"
+            "15. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique inutilement. Ne t'excuse pas excessivement.\n"
+            "16. FORMATAGE VISUEL : Utilise des puces (•) pour lister les commandes. Mets les éléments importants en gras (ex: **PayPal 5€**). Ajoute des emojis pertinents (💳, ⏳, ✅, ❌, 🎰, 🧠, 🔫, 🧩, 🎱, 🃏, 🌤️) pour rendre la lecture agréable.\n"
             "Réponds en français.\n\n"
             f"--- DEBUG LOGS (Pour info technique seulement, ne pas citer à l'utilisateur sauf s'il demande des détails techniques) ---\n{debug_logs_str}"
         )
