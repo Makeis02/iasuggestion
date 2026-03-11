@@ -2975,6 +2975,77 @@ def _get_support_context(user_id: str) -> dict:
     except Exception as e:
         log(f"Error fetching survey transactions: {str(e)}")
         context["surveys"] = []
+
+    try:
+        log("Querying 'transaction_offers' table (offerwall)...")
+        offer_tx_rows = _supabase_get_first_success(
+            "transaction_offers",
+            variants=[
+                {
+                    "select": "offer_id,offer_name,event_name,type,points,status,created_at",
+                    "user_id": f"eq.{user_id}",
+                    "order": "created_at.desc",
+                    "limit": "10",
+                }
+            ],
+            timeout_s=5,
+        )
+
+        context["offers"] = []
+        for row in offer_tx_rows:
+            if isinstance(row, dict):
+                status_raw = row.get("status")
+                status = "completed" if safe_int(status_raw, 0) == 1 else _safe_str(status_raw or "pending")
+                context["offers"].append(
+                    {
+                        "offer_id": _safe_str(row.get("offer_id")),
+                        "name": _safe_str(row.get("offer_name") or "Offre"),
+                        "event": _safe_str(row.get("event_name") or row.get("type") or ""),
+                        "type": _safe_str(row.get("type") or ""),
+                        "points": safe_int(row.get("points"), 0),
+                        "status": status,
+                        "date": _safe_str(row.get("created_at")),
+                    }
+                )
+
+        log("Querying 'offer_tracking' table (offerwall)...")
+        tracking_rows = _supabase_get_first_success(
+            "offer_tracking",
+            variants=[
+                {
+                    "select": "offer_id,action_type,status,created_at,metadata",
+                    "user_id": f"eq.{user_id}",
+                    "order": "created_at.desc",
+                    "limit": "10",
+                }
+            ],
+            timeout_s=5,
+        )
+
+        context["offers_tracking"] = []
+        for row in tracking_rows:
+            if isinstance(row, dict):
+                meta = row.get("metadata") or {}
+                offer_name = ""
+                if isinstance(meta, dict):
+                    offer_name = _safe_str(meta.get("offer_name"))
+                context["offers_tracking"].append(
+                    {
+                        "offer_id": _safe_str(row.get("offer_id")),
+                        "name": offer_name or "Offre",
+                        "action": _safe_str(row.get("action_type") or ""),
+                        "status": _safe_str(row.get("status") or ""),
+                        "date": _safe_str(row.get("created_at")),
+                    }
+                )
+
+        log(
+            f"Found {len(context['offers'])} offer transactions and {len(context['offers_tracking'])} offer tracking rows."
+        )
+    except Exception as e:
+        log(f"Error fetching offerwall data: {str(e)}")
+        context["offers"] = []
+        context["offers_tracking"] = []
         
     return context
 
@@ -3093,6 +3164,25 @@ async def support_chat(request: Request):
                 date_str = s['date'][:10]
                 lines.append(f"- [{s['provider']}] {date_str}: {s['points']} pts ({s['status']})")
             surveys_summary = "\n".join(lines)
+
+        offers_summary = "Aucune offre récente."
+        offer_lines = []
+        if ctx.get("offers_tracking"):
+            for o in ctx["offers_tracking"][:3]:
+                date_str = (o.get("date") or "")[:10]
+                name = o.get("name") or "Offre"
+                offer_lines.append(f"- [Offre] {date_str}: {name} - in_progress")
+        if ctx.get("offers"):
+            for o in ctx["offers"]:
+                if len(offer_lines) >= 5:
+                    break
+                date_str = (o.get("date") or "")[:10]
+                name = o.get("name") or "Offre"
+                status = o.get("status") or "pending"
+                pts = o.get("points") or 0
+                offer_lines.append(f"- [Offre] {date_str}: {name} - {status} - {pts} pts")
+        if offer_lines:
+            offers_summary = "\n".join(offer_lines)
             
         # Debug logs pour l'admin
         debug_logs_str = "\n".join([f"[LOG] {l}" for l in ctx.get("debug_logs", [])])
@@ -3109,6 +3199,7 @@ async def support_chat(request: Request):
             f"Stats Poker Texas Hold'em :\n{poker_summary}\n\n"
             f"Progression SkyCatcher {sky_level_info}:\n{skycatcher_summary}\n\n"
             f"Derniers Sondages Complétés :\n{surveys_summary}\n\n"
+            f"Dernières Offres (TimeWall/Offerwall) :\n{offers_summary}\n\n"
             f"Boutique :\n{gifts_summary}\n\n"
             "Règles :\n"
             "1. Sois courtois, empathique et concis.\n"
@@ -3127,6 +3218,7 @@ async def support_chat(request: Request):
             "    - Nous proposons des sondages via **CPX Research** et **RapidoReach**.\n"
             "    - Pour les offres (murs d'offres), nous travaillons avec **TimeWall**.\n"
             "    - Si l'utilisateur parle de sondages, regarde 'Derniers Sondages Complétés' pour voir s'il a reçu des points récemment.\n"
+            "    - Si l'utilisateur parle d'offres, regarde 'Dernières Offres (TimeWall/Offerwall)' pour voir si une conversion est en cours ou validée.\n"
             "    - Si un utilisateur a un problème avec une offre spécifique, conseille-lui de contacter directement le support du mur d'offre concerné (ex: Support TimeWall) car nous n'avons pas la main dessus.\n"
             "    - RÈGLES GÉNÉRALES SONDAGES :\n"
             "      • Les sondages dépendent de partenaires externes. Être invité ne garantit pas d'être accepté jusqu'à la fin (disqualification possible si profil non correspondant).\n"
@@ -3140,6 +3232,21 @@ async def support_chat(request: Request):
             "    - RÈGLES RAPIDOREACH :\n"
             "      • La disponibilité varie selon le profil et le pays.\n"
             "      • Les erreurs techniques peuvent venir de l'initialisation ou de l'affichage.\n"
+            "    - RÈGLES GÉNÉRALES OFFRES (TimeWall et autres) :\n"
+            "      • Les offres dépendent de partenaires externes. Une récompense n'est JAMAIS garantie tant qu'elle n'est pas confirmée/validée.\n"
+            "      • L'utilisateur doit lancer l'offre depuis notre site, respecter toutes les conditions, et rester sur le même appareil/pays/compte pendant toute l'offre.\n"
+            "      • Tracking : autoriser le suivi publicitaire, éviter les adblockers agressifs, ne pas utiliser VPN/proxy/émulateur, ne pas avoir déjà installé l'app.\n"
+            "      • Un seul compte par utilisateur (multi-comptes, automatisation, comportements suspects = refus/annulation possibles).\n"
+            "      • En cas de crédit manquant, demander : prestataire, nom/ID de l'offre, date+heure, montant attendu, appareil, pays, capture d'écran + preuve de l'étape atteinte.\n"
+            "      • Si c'est complexe/non vérifiable, rediriger vers un agent humain. Ne jamais promettre un crédit manuel.\n"
+            "    - RÈGLES TIMEWALL :\n"
+            "      • TimeWall applique des règles strictes (un seul compte, pas de VPN/proxy, IP/appareil déjà utilisé = possible refus).\n"
+            "      • Certains crédits peuvent prendre jusqu'à 2 semaines. Certaines tâches ont un système de dispute, mais pas toutes.\n"
+            "      • Après ~30 jours sans crédit, conseiller de contacter TimeWall avec l'ID de l'offre et les preuves.\n"
+            "    - AUTRES PRESTATAIRES :\n"
+            "      • BitcoTasks : statut approuvé/rejeté/dispute selon les tâches ; vérifier l'historique et la raison du rejet.\n"
+            "      • Notik : tracking lié à l'appareil/navigateur ; rester sur le même appareil et ne pas bloquer le suivi.\n"
+            "      • Offery : validation selon pays/appareil/anti-fraude ; confirmation requise avant crédit.\n"
             "14. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
             "15. Si tu ne sais pas, suggère de contacter le support humain.\n"
             "16. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique inutilement.\n"
@@ -3147,10 +3254,11 @@ async def support_chat(request: Request):
             "    - Utilise IMPÉRATIVEMENT des sauts de ligne entre chaque élément d'une liste.\n"
             "    - Utilise des puces (•) pour chaque élément sur une NOUVELLE ligne.\n"
             "    - Mets les **Noms de Jeux** et **Montants** en GRAS.\n"
-            "    - Utilise des emojis en début de ligne : 🎮 pour les jeux, 💳 pour les commandes, ⏳ pour l'attente, 📋 pour les sondages.\n"
+            "    - Utilise des emojis en début de ligne : 🎮 pour les jeux, 💳 pour les commandes, ⏳ pour l'attente, 📋 pour les sondages, 🎯 pour les offres.\n"
             "    - Exemple de format attendu :\n"
             "      • 🎮 **GrattoFolie** : Jeu de grattage...\n"
             "      • 📋 **Sondage CPX** : Disponible...\n"
+            "      • 🎯 **Offre TimeWall** : En attente de validation...\n"
             "Réponds en français.\n\n"
             f"--- DEBUG LOGS (Pour info technique seulement, ne pas citer à l'utilisateur sauf s'il demande des détails techniques) ---\n{debug_logs_str}"
         )
@@ -3209,4 +3317,3 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
-
