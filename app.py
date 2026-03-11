@@ -216,6 +216,41 @@ def _support_get_session_history(session_id: str, limit: int = 10) -> tuple[str,
     except Exception:
         return "", 0
 
+def _support_user_seems_blocked(message: str) -> bool:
+    m = re.sub(r"\s+", " ", _safe_str(message).lower()).strip()
+    if not m:
+        return False
+    triggers = [
+        "bloqué",
+        "bloque",
+        "ça marche pas",
+        "ca marche pas",
+        "ne marche pas",
+        "ne fonctionne pas",
+        "j'ai tout essay",
+        "jai tout essay",
+        "rien ne marche",
+        "rien ne fonctionne",
+        "toujours pareil",
+        "impossible",
+        "bug",
+        "erreur",
+        "ça bug",
+        "ca bug",
+        "rien de cela",
+    ]
+    return any(t in m for t in triggers)
+
+def _support_bot_offered_human_recently(text: str) -> bool:
+    s = _safe_str(text).lower()
+    return (
+        ("agent humain" in s)
+        or ("parler à un humain" in s)
+        or ("parler a un humain" in s)
+        or ("mettre en relation" in s)
+        or ("souhaitez-vous" in s and "humain" in s)
+    )
+
 def _support_last_bot_asked_human(ticket_id: str) -> bool:
     try:
         rows = _supabase_get(
@@ -3811,6 +3846,12 @@ async def support_chat(request: Request):
             }
             
         content = llm.get("content", "")
+        should_force_human_offer = (not is_first_turn) and (user_turns >= 2) and _support_user_seems_blocked(message)
+        if should_force_human_offer and not _support_bot_offered_human_recently(content):
+            content = _safe_str(content).rstrip()
+            if content:
+                content += "\n\n"
+            content += "Je peux vous mettre en relation avec un agent humain. Souhaitez-vous ?"
         if resolved_session_id:
             try:
                 _supabase_post(
@@ -3867,3 +3908,4 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
+
