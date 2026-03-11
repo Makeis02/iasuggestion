@@ -72,6 +72,27 @@ def _supabase_post(table: str, payload, timeout_s: int = 20):
         raise RuntimeError(f"Erreur Supabase POST {table}: HTTP {resp.status_code} - {resp.text}")
     return resp.json() or []
 
+def _supabase_patch(table: str, match: dict, payload: dict, timeout_s: int = 20) -> list[dict]:
+    rest_url = resources["supabase_rest_url"]
+    headers = dict(resources["supabase_headers"])
+    headers["Content-Type"] = "application/json"
+    headers["Prefer"] = "return=representation"
+    resp = requests.patch(
+        f"{rest_url}/{table}",
+        params=match,
+        json=payload,
+        headers=headers,
+        timeout=timeout_s,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise RuntimeError(f"Erreur Supabase PATCH {table}: HTTP {resp.status_code} - {resp.text}")
+    if resp.status_code == 204:
+        return []
+    try:
+        return resp.json() or []
+    except Exception:
+        return []
+
 def _supabase_rpc(func: str, body: dict, timeout_s: int = 20) -> dict:
     rest_url = resources["supabase_rest_url"]
     headers = resources["supabase_headers"]
@@ -81,9 +102,14 @@ def _supabase_rpc(func: str, body: dict, timeout_s: int = 20) -> dict:
         headers=headers,
         timeout=timeout_s,
     )
-    if resp.status_code != 200:
+    if resp.status_code not in (200, 201, 204):
         raise RuntimeError(f"RPC {func}: HTTP {resp.status_code} - {resp.text}")
-    return resp.json() or {}
+    if resp.status_code == 204:
+        return {}
+    try:
+        return resp.json() or {}
+    except Exception:
+        return {}
 
 def _support_should_request_human(message: str) -> bool:
     m = _safe_str(message).strip().lower()
@@ -152,6 +178,98 @@ def _support_last_bot_asked_human(ticket_id: str) -> bool:
     except Exception:
         return False
 
+def _support_infer_ticket_subject(text: str) -> str:
+    t = _safe_str(text).lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return "Support"
+
+    def has(*words: str) -> bool:
+        return any(w in t for w in words)
+
+    if has("mot de passe", "password", "mdp", "connexion", "login", "se connecter", "compte", "email", "e-mail", "verification", "vérification", "2fa", "auth"):
+        if has("mot de passe", "password", "mdp"):
+            return "Compte - Mot de passe"
+        if has("connexion", "login", "se connecter"):
+            return "Compte - Connexion"
+        return "Compte"
+
+    if has("paypal", "virement", "retrait", "withdraw", "paiement", "payment"):
+        return "Paiement - Retrait"
+
+    if has("carte cadeau", "giftcard", "gift card", "code", "commande", "order", "livraison"):
+        return "Boutique - Commande"
+
+    if has("sondage", "survey", "cpx", "rapido", "rapidoreach", "theoremreach"):
+        return "Sondages - Crédit manquant"
+
+    if has("offre", "offer", "timewall", "ogads", "notik", "offery", "bitcotasks", "conversion", "postback", "tracking"):
+        return "Offres - Crédit manquant"
+
+    if has("points", "crédit", "credit", "manquant", "non reçu", "pas reçu", "en attente", "pending", "refus", "refusé", "rejet", "rejeté"):
+        return "Récompenses - Problème de crédit"
+
+    if has("bug", "erreur", "crash", "bloque", "ne marche pas", "ne fonctionne pas", "chargement", "page blanche"):
+        return "Technique - Bug"
+
+    if has("ban", "banni", "bannie", "mute", "suspendu", "suspension", "bloqué", "bloquee", "bloqué"):
+        return "Compte - Restriction"
+
+    return "Support"
+
+def _support_suggest_subject_from_ticket(ticket_id: str, latest_message: str) -> str:
+    tid = _safe_str(ticket_id).strip()
+    if not tid:
+        return _support_infer_ticket_subject(latest_message)
+    try:
+        rows = _supabase_get(
+            "support_chat_ticket_messages",
+            params={
+                "select": "message,sender,created_at",
+                "ticket_id": f"eq.{tid}",
+                "order": "created_at.desc",
+                "limit": "20",
+            },
+            timeout_s=5,
+        )
+        user_msgs: list[str] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            if _safe_str(r.get("sender")).lower() != "user":
+                continue
+            msg = _safe_str(r.get("message")).strip()
+            if msg:
+                user_msgs.append(msg)
+            if len(user_msgs) >= 6:
+                break
+        combined = " | ".join(reversed(user_msgs)) if user_msgs else _safe_str(latest_message)
+        return _support_infer_ticket_subject(combined)
+    except Exception:
+        return _support_infer_ticket_subject(latest_message)
+
+def _support_get_ticket_state(ticket_id: str, user_id: str) -> dict | None:
+    tid = _safe_str(ticket_id).strip()
+    uid = _safe_str(user_id).strip()
+    if not tid or not uid:
+        return None
+    try:
+        rows = _supabase_get(
+            "support_chat_tickets",
+            params={
+                "select": "id,user_id,needs_human,status",
+                "id": f"eq.{tid}",
+                "user_id": f"eq.{uid}",
+                "limit": "1",
+            },
+            timeout_s=5,
+        )
+        if rows and isinstance(rows[0], dict):
+            return rows[0]
+    except Exception:
+        return None
+    return None
+
 def _support_get_or_create_ticket(user_id: str, message: str, ticket_id: str | None) -> tuple[str | None, bool]:
     uid = _safe_str(user_id).strip()
     if not uid or uid == "anonymous":
@@ -181,6 +299,7 @@ def _support_get_or_create_ticket(user_id: str, message: str, ticket_id: str | N
             params={
                 "select": "id,updated_at,status",
                 "user_id": f"eq.{uid}",
+                "needs_human": "eq.false",
                 "status": "in.(ouvert,en_cours)",
                 "order": "updated_at.desc",
                 "limit": "1",
@@ -3226,19 +3345,42 @@ async def support_chat(request: Request):
             except Exception:
                 pass
 
+        ticket_state = None
+        if resolved_ticket_id:
+            ticket_state = _support_get_ticket_state(resolved_ticket_id, user_id)
+
         try:
             if resolved_ticket_id:
+                if ticket_state and bool(ticket_state.get("needs_human")) and _safe_str(ticket_state.get("status")) in ("ouvert", "en_cours"):
+                    return {
+                        "response": "",
+                        "source": "human_mode",
+                        "ticket_id": resolved_ticket_id,
+                        "suppress_bot_message": True,
+                    }
+
                 if _support_should_request_human(message) or (_support_is_yes(message) and _support_last_bot_asked_human(resolved_ticket_id)):
                     try:
+                        subject = _support_suggest_subject_from_ticket(resolved_ticket_id, message)
                         _supabase_rpc(
                             "request_human_support_for_chat",
                             {"p_ticket_id": resolved_ticket_id, "p_user_id": user_id},
                             timeout_s=5,
                         )
+                        try:
+                            _supabase_patch(
+                                "support_chat_tickets",
+                                match={"id": f"eq.{resolved_ticket_id}", "user_id": f"eq.{user_id}"},
+                                payload={"subject": subject},
+                                timeout_s=5,
+                            )
+                        except Exception:
+                            pass
                         return {
                             "response": "Merci, un agent va vous répondre dès que possible. Votre ticket est ouvert.",
                             "source": "human_ticket_opened",
                             "ticket_id": resolved_ticket_id,
+                            "suppress_bot_message": True,
                         }
                     except Exception as e:
                         msg = _safe_str(e)
@@ -3265,6 +3407,7 @@ async def support_chat(request: Request):
                             "response": text,
                             "source": "human_ticket_error",
                             "ticket_id": resolved_ticket_id,
+                            "suppress_bot_message": True,
                         }
         except Exception:
             pass
