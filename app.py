@@ -152,6 +152,70 @@ def _support_is_yes(message: str) -> bool:
         return True
     return False
 
+def _support_last_bot_asked_human_session(session_id: str) -> bool:
+    sid = _safe_str(session_id).strip()
+    if not sid:
+        return False
+    try:
+        rows = _supabase_get(
+            "support_chat_session_messages",
+            params={
+                "select": "sender,message,created_at",
+                "session_id": f"eq.{sid}",
+                "order": "created_at.desc",
+                "limit": "12",
+            },
+            timeout_s=5,
+        )
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            if _safe_str(r.get("sender")).lower() != "bot":
+                continue
+            txt = _safe_str(r.get("message")).lower()
+            if "agent" in txt and "humain" in txt:
+                return True
+            if "parler" in txt and "humain" in txt:
+                return True
+            if "mettre" in txt and "relation" in txt and "humain" in txt:
+                return True
+        return False
+    except Exception:
+        return False
+
+def _support_get_session_history(session_id: str, limit: int = 10) -> tuple[str, int]:
+    sid = _safe_str(session_id).strip()
+    if not sid:
+        return "", 0
+    try:
+        rows = _supabase_get(
+            "support_chat_session_messages",
+            params={
+                "select": "sender,message,created_at",
+                "session_id": f"eq.{sid}",
+                "order": "created_at.asc",
+                "limit": str(max(1, min(50, limit))),
+            },
+            timeout_s=5,
+        )
+        lines: list[str] = []
+        user_count = 0
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sender = _safe_str(r.get("sender")).lower()
+            msg = _safe_str(r.get("message")).strip()
+            if not msg:
+                continue
+            if sender == "user":
+                user_count += 1
+                lines.append(f"Utilisateur: {msg}")
+            elif sender == "bot":
+                lines.append(f"Assistant: {msg}")
+        return "\n".join(lines), user_count
+    except Exception:
+        return "", 0
+
 def _support_last_bot_asked_human(ticket_id: str) -> bool:
     try:
         rows = _supabase_get(
@@ -3399,7 +3463,13 @@ async def support_chat(request: Request):
                 pass
 
         try:
-            if resolved_session_id and _support_should_request_human(message):
+            wants_human = False
+            if resolved_session_id:
+                wants_human = _support_should_request_human(message) or (
+                    _support_is_yes(message) and _support_last_bot_asked_human_session(resolved_session_id)
+                )
+
+            if resolved_session_id and wants_human:
                 try:
                     allowed = _supabase_rpc(
                         "can_open_human_support_ticket",
@@ -3413,9 +3483,9 @@ async def support_chat(request: Request):
                 except Exception as e:
                     msg = _safe_str(e)
                     if "ticket_limit_reached" in msg:
-                        text = "Vous avez déjà 3 tickets en attente (non résolus/fermés). Merci d’attendre une réponse ou de fermer un ticket existant."
+                        text = "Vous avez déjà des demandes de support en attente. Merci d’attendre une réponse avant d’en ouvrir une nouvelle."
                     else:
-                        text = "Je n’arrive pas à ouvrir un ticket pour le moment. Réessayez plus tard ou contactez le support."
+                        text = "Je n’arrive pas à vous mettre en relation avec un agent humain pour le moment. Réessayez plus tard."
                     return {
                         "response": text,
                         "source": "human_ticket_error",
@@ -3495,7 +3565,7 @@ async def support_chat(request: Request):
                             {
                                 "ticket_id": new_ticket_id,
                                 "user_id": user_id,
-                                "message": "Merci, un agent va vous répondre dès que possible. Votre ticket est ouvert.",
+                                "message": "Merci, je vous mets en relation avec un agent humain. Vous recevrez une réponse ici dès que possible.",
                                 "is_admin": True,
                                 "sender": "bot",
                                 "attachments": [],
@@ -3517,7 +3587,7 @@ async def support_chat(request: Request):
                         pass
 
                 return {
-                    "response": "Merci, un agent va vous répondre dès que possible. Votre ticket est ouvert.",
+                    "response": "Merci, je vous mets en relation avec un agent humain. Vous recevrez une réponse ici dès que possible.",
                     "source": "human_ticket_opened",
                     "ticket_id": new_ticket_id,
                     "suppress_bot_message": True,
@@ -3644,8 +3714,15 @@ async def support_chat(request: Request):
         # Debug logs pour l'admin
         debug_logs_str = "\n".join([f"[LOG] {l}" for l in ctx.get("debug_logs", [])])
             
+        conv_history = ""
+        user_turns = 0
+        if resolved_session_id:
+            conv_history, user_turns = _support_get_session_history(resolved_session_id, limit=12)
+        is_first_turn = user_turns <= 1
+
         system_prompt = (
             f"Tu es le bot support de GiftPlayz. L'utilisateur {ctx.get('username', 'Inconnu')} (Niveau {ctx['level']}, {ctx['points']} pts) te parle.\n\n"
+            f"Conversation en cours (dernier échanges) :\n{conv_history or 'Aucun historique.'}\n\n"
             f"Activité Récente :\n{tx_summary}\n\n"
             f"Commandes Boutique (Virements & Cartes) :\n{orders_summary}\n\n"
             f"Dernières parties GrattoFolie :\n{grattofolie_summary}\n\n"
@@ -3658,6 +3735,10 @@ async def support_chat(request: Request):
             f"Derniers Sondages Complétés :\n{surveys_summary}\n\n"
             f"Dernières Offres (TimeWall/Offerwall) :\n{offers_summary}\n\n"
             f"Boutique :\n{gifts_summary}\n\n"
+            "Fonctionnalités Connues (ne pas inventer) :\n"
+            "• Connexion : page Login avec lien **Mot de passe oublié ?**\n"
+            "• Réinitialisation mot de passe : pages **/forgot-password** et **/reset-password** via email.\n"
+            "• Changer mot de passe (si connecté) : dans le **Profil**, l'utilisateur peut modifier son mot de passe.\n\n"
             "Règles :\n"
             "1. Sois courtois, empathique et concis.\n"
             "2. Si l'utilisateur demande où sont ses points d'OFFRE, regarde 'Activité Récente'. Si 'pending', explique le délai (24-48h).\n"
@@ -3705,17 +3786,12 @@ async def support_chat(request: Request):
             "      • Notik : tracking lié à l'appareil/navigateur ; rester sur le même appareil et ne pas bloquer le suivi.\n"
             "      • Offery : validation selon pays/appareil/anti-fraude ; confirmation requise avant crédit.\n"
             "14. Tu ne PEUX PAS créditer de points ni valider de commandes manuellement.\n"
-            "15. Si tu ne sais pas, propose d'ouvrir un ticket pour un humain. Demande explicitement confirmation (oui/non) avant d'ouvrir. Mentionne qu'il y a un maximum de 3 tickets ouverts par utilisateur.\n"
-            "16. RÉPONSES COURTES : Va droit au but. Ne récite pas tout l'historique inutilement.\n"
-            "17. FORMATAGE VISUEL STRICT :\n"
-            "    - Utilise IMPÉRATIVEMENT des sauts de ligne entre chaque élément d'une liste.\n"
-            "    - Utilise des puces (•) pour chaque élément sur une NOUVELLE ligne.\n"
-            "    - Mets les **Noms de Jeux** et **Montants** en GRAS.\n"
-            "    - Utilise des emojis en début de ligne : 🎮 pour les jeux, 💳 pour les commandes, ⏳ pour l'attente, 📋 pour les sondages, 🎯 pour les offres.\n"
-            "    - Exemple de format attendu :\n"
-            "      • 🎮 **GrattoFolie** : Jeu de grattage...\n"
-            "      • 📋 **Sondage CPX** : Disponible...\n"
-            "      • 🎯 **Offre TimeWall** : En attente de validation...\n"
+            f"15. {('PREMIER MESSAGE : ne propose PAS un agent humain si l’utilisateur ne le demande pas explicitement. Concentre-toi d’abord sur 1-2 questions de diagnostic + étapes concrètes. ' if is_first_turn else '')}Si tu ne peux pas résoudre, propose simplement : « Je peux vous mettre en relation avec un agent humain. Souhaitez-vous ? » (sans parler de ticket, sans parler de bouton, sans parler de limite).\n"
+            "16. Ne JAMAIS inventer une fonctionnalité (ex: « pas de page », « pas de modal », « bouton ouvrir un ticket »). Si tu n'es pas sûr, dis-le et propose un agent humain.\n"
+            "17. Pour un problème de mot de passe :\n"
+            "    - Si l'utilisateur n'arrive pas à se connecter : guider vers **Mot de passe oublié ?** (page /forgot-password) puis lien reçu (page /reset-password).\n"
+            "    - Si l'utilisateur est connecté et veut changer : guider vers la section mot de passe du **Profil**.\n"
+            "18. Réponses courtes : va droit au but. Ne récite pas tout l'historique.\n"
             "Réponds en français.\n\n"
             f"--- DEBUG LOGS (Pour info technique seulement, ne pas citer à l'utilisateur sauf s'il demande des détails techniques) ---\n{debug_logs_str}"
         )
