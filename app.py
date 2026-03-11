@@ -328,6 +328,61 @@ def _support_get_or_create_ticket(user_id: str, message: str, ticket_id: str | N
         return _safe_str(created.get("ticket_id")), True
     return None, False
 
+def _support_get_or_create_session(user_id: str, session_id: str | None) -> str | None:
+    uid = _safe_str(user_id).strip()
+    if not uid or uid == "anonymous":
+        return None
+
+    provided = _safe_str(session_id).strip()
+    if provided:
+        try:
+            rows = _supabase_get(
+                "support_chat_sessions",
+                params={
+                    "select": "id,user_id,status",
+                    "id": f"eq.{provided}",
+                    "user_id": f"eq.{uid}",
+                    "limit": "1",
+                },
+                timeout_s=5,
+            )
+            if rows and isinstance(rows[0], dict) and _safe_str(rows[0].get("id")):
+                if _safe_str(rows[0].get("status")) == "closed":
+                    return None
+                return _safe_str(rows[0].get("id"))
+        except Exception:
+            pass
+
+    try:
+        existing = _supabase_get(
+            "support_chat_sessions",
+            params={
+                "select": "id,updated_at,status",
+                "user_id": f"eq.{uid}",
+                "status": "eq.open",
+                "order": "updated_at.desc",
+                "limit": "1",
+            },
+            timeout_s=5,
+        )
+        if existing and isinstance(existing[0], dict) and _safe_str(existing[0].get("id")):
+            return _safe_str(existing[0].get("id"))
+    except Exception:
+        pass
+
+    created = _supabase_rpc(
+        "create_support_chat_session",
+        {"p_user_id": uid},
+        timeout_s=5,
+    )
+    if isinstance(created, str) and created:
+        return created
+    if isinstance(created, dict) and created.get("id"):
+        return _safe_str(created.get("id"))
+    if isinstance(created, dict) and created.get("session_id"):
+        return _safe_str(created.get("session_id"))
+    return None
+
 def _safe_str(value) -> str:
     if value is None:
         return ""
@@ -3318,7 +3373,7 @@ async def support_chat(request: Request):
             
         user_id = _safe_str(body.get("user_id")).strip()
         message = _safe_str(body.get("message")).strip()
-        ticket_id = _safe_str(body.get("ticket_id")).strip()
+        session_id = _safe_str(body.get("session_id")).strip()
         
         if not user_id or not message:
             # Fallback si user_id manque (mode démo ou déconnecté)
@@ -3327,88 +3382,146 @@ async def support_chat(request: Request):
             else:
                 raise HTTPException(status_code=400, detail="user_id and message required")
 
-        resolved_ticket_id, already_inserted = _support_get_or_create_ticket(user_id, message, ticket_id)
-        if resolved_ticket_id and not already_inserted:
+        resolved_session_id = _support_get_or_create_session(user_id, session_id)
+        if resolved_session_id:
             try:
                 _supabase_post(
-                    "support_chat_ticket_messages",
+                    "support_chat_session_messages",
                     {
-                        "ticket_id": resolved_ticket_id,
+                        "session_id": resolved_session_id,
                         "user_id": user_id,
-                        "message": message,
-                        "is_admin": False,
                         "sender": "user",
-                        "attachments": [],
+                        "message": message,
                     },
                     timeout_s=5,
                 )
             except Exception:
                 pass
 
-        ticket_state = None
-        if resolved_ticket_id:
-            ticket_state = _support_get_ticket_state(resolved_ticket_id, user_id)
-
         try:
-            if resolved_ticket_id:
-                if ticket_state and bool(ticket_state.get("needs_human")) and _safe_str(ticket_state.get("status")) in ("ouvert", "en_cours"):
+            if resolved_session_id and _support_should_request_human(message):
+                try:
+                    allowed = _supabase_rpc(
+                        "can_open_human_support_ticket",
+                        {"p_user_id": user_id},
+                        timeout_s=5,
+                    )
+                    if allowed is False:
+                        raise RuntimeError("ticket_limit_reached")
+                    if isinstance(allowed, dict) and allowed.get("can_open") is False:
+                        raise RuntimeError("ticket_limit_reached")
+                except Exception as e:
+                    msg = _safe_str(e)
+                    if "ticket_limit_reached" in msg:
+                        text = "Vous avez déjà 3 tickets en attente (non résolus/fermés). Merci d’attendre une réponse ou de fermer un ticket existant."
+                    else:
+                        text = "Je n’arrive pas à ouvrir un ticket pour le moment. Réessayez plus tard ou contactez le support."
                     return {
-                        "response": "",
-                        "source": "human_mode",
-                        "ticket_id": resolved_ticket_id,
+                        "response": text,
+                        "source": "human_ticket_error",
+                        "session_id": resolved_session_id,
                         "suppress_bot_message": True,
                     }
 
-                if _support_should_request_human(message) or (_support_is_yes(message) and _support_last_bot_asked_human(resolved_ticket_id)):
+                subject = _support_suggest_subject_from_ticket("", message)
+                if resolved_session_id:
                     try:
-                        subject = _support_suggest_subject_from_ticket(resolved_ticket_id, message)
-                        _supabase_rpc(
-                            "request_human_support_for_chat",
-                            {"p_ticket_id": resolved_ticket_id, "p_user_id": user_id},
+                        rows = _supabase_get(
+                            "support_chat_session_messages",
+                            params={
+                                "select": "sender,message,created_at",
+                                "session_id": f"eq.{resolved_session_id}",
+                                "order": "created_at.asc",
+                                "limit": "50",
+                            },
                             timeout_s=5,
                         )
-                        try:
-                            _supabase_patch(
-                                "support_chat_tickets",
-                                match={"id": f"eq.{resolved_ticket_id}", "user_id": f"eq.{user_id}"},
-                                payload={"subject": subject},
-                                timeout_s=5,
-                            )
-                        except Exception:
-                            pass
-                        return {
-                            "response": "Merci, un agent va vous répondre dès que possible. Votre ticket est ouvert.",
-                            "source": "human_ticket_opened",
-                            "ticket_id": resolved_ticket_id,
-                            "suppress_bot_message": True,
-                        }
-                    except Exception as e:
-                        msg = _safe_str(e)
-                        if "ticket_limit_reached" in msg:
-                            text = "Vous avez déjà 3 tickets en attente (non résolus/fermés). Merci d’attendre une réponse ou de fermer un ticket existant."
-                        else:
-                            text = "Je n’arrive pas à ouvrir un ticket pour le moment. Réessayez plus tard ou contactez le support."
-                        try:
+                        combined = " | ".join([_safe_str(r.get("message")) for r in rows if isinstance(r, dict)])
+                        subject = _support_infer_ticket_subject(combined) if combined else subject
+                    except Exception:
+                        pass
+
+                ticket_rows = _supabase_post(
+                    "support_chat_tickets",
+                    {
+                        "user_id": user_id,
+                        "subject": subject,
+                        "status": "ouvert",
+                        "priority": "normale",
+                        "needs_human": True,
+                    },
+                    timeout_s=5,
+                )
+                new_ticket_id = _safe_str(ticket_rows[0].get("id")) if ticket_rows and isinstance(ticket_rows[0], dict) else ""
+
+                if new_ticket_id and resolved_session_id:
+                    try:
+                        session_msgs = _supabase_get(
+                            "support_chat_session_messages",
+                            params={
+                                "select": "sender,message,created_at",
+                                "session_id": f"eq.{resolved_session_id}",
+                                "order": "created_at.asc",
+                                "limit": "200",
+                            },
+                            timeout_s=5,
+                        )
+                        for r in session_msgs:
+                            if not isinstance(r, dict):
+                                continue
+                            sender = _safe_str(r.get("sender")).lower()
+                            msg = _safe_str(r.get("message"))
+                            if not msg:
+                                continue
                             _supabase_post(
                                 "support_chat_ticket_messages",
                                 {
-                                    "ticket_id": resolved_ticket_id,
+                                    "ticket_id": new_ticket_id,
                                     "user_id": user_id,
-                                    "message": text,
-                                    "is_admin": True,
-                                    "sender": "bot",
+                                    "message": msg,
+                                    "is_admin": True if sender == "bot" else False,
+                                    "sender": "bot" if sender == "bot" else "user",
                                     "attachments": [],
                                 },
                                 timeout_s=5,
                             )
-                        except Exception:
-                            pass
-                        return {
-                            "response": text,
-                            "source": "human_ticket_error",
-                            "ticket_id": resolved_ticket_id,
-                            "suppress_bot_message": True,
-                        }
+                    except Exception:
+                        pass
+
+                if new_ticket_id:
+                    try:
+                        _supabase_post(
+                            "support_chat_ticket_messages",
+                            {
+                                "ticket_id": new_ticket_id,
+                                "user_id": user_id,
+                                "message": "Merci, un agent va vous répondre dès que possible. Votre ticket est ouvert.",
+                                "is_admin": True,
+                                "sender": "bot",
+                                "attachments": [],
+                            },
+                            timeout_s=5,
+                        )
+                    except Exception:
+                        pass
+
+                if resolved_session_id:
+                    try:
+                        _supabase_patch(
+                            "support_chat_sessions",
+                            match={"id": f"eq.{resolved_session_id}", "user_id": f"eq.{user_id}"},
+                            payload={"status": "closed"},
+                            timeout_s=5,
+                        )
+                    except Exception:
+                        pass
+
+                return {
+                    "response": "Merci, un agent va vous répondre dès que possible. Votre ticket est ouvert.",
+                    "source": "human_ticket_opened",
+                    "ticket_id": new_ticket_id,
+                    "suppress_bot_message": True,
+                }
         except Exception:
             pass
             
@@ -3622,17 +3735,15 @@ async def support_chat(request: Request):
             }
             
         content = llm.get("content", "")
-        if resolved_ticket_id:
+        if resolved_session_id:
             try:
                 _supabase_post(
-                    "support_chat_ticket_messages",
+                    "support_chat_session_messages",
                     {
-                        "ticket_id": resolved_ticket_id,
+                        "session_id": resolved_session_id,
                         "user_id": user_id,
-                        "message": _safe_str(content),
-                        "is_admin": True,
                         "sender": "bot",
-                        "attachments": [],
+                        "message": _safe_str(content),
                     },
                     timeout_s=5,
                 )
@@ -3643,7 +3754,7 @@ async def support_chat(request: Request):
             "response": content,
             "source": llm.get("source", "llm"),
             "model": llm.get("model", ""),
-            "ticket_id": resolved_ticket_id,
+            "session_id": resolved_session_id,
             "debug_context": system_prompt
         }
     except Exception as e:
