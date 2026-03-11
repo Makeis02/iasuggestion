@@ -8,7 +8,6 @@ import random
 import re
 import uuid
 import hashlib
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -333,7 +332,6 @@ def _support_get_or_create_session(user_id: str, session_id: str | None) -> str 
     uid = _safe_str(user_id).strip()
     if not uid or uid == "anonymous":
         return None
-    today_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
 
     provided = _safe_str(session_id).strip()
     if provided:
@@ -341,7 +339,7 @@ def _support_get_or_create_session(user_id: str, session_id: str | None) -> str 
             rows = _supabase_get(
                 "support_chat_sessions",
                 params={
-                    "select": "id,user_id,status,updated_at",
+                    "select": "id,user_id,status",
                     "id": f"eq.{provided}",
                     "user_id": f"eq.{uid}",
                     "limit": "1",
@@ -350,8 +348,6 @@ def _support_get_or_create_session(user_id: str, session_id: str | None) -> str 
             )
             if rows and isinstance(rows[0], dict) and _safe_str(rows[0].get("id")):
                 if _safe_str(rows[0].get("status")) == "closed":
-                    return None
-                if _safe_str(rows[0].get("updated_at")) < today_start:
                     return None
                 return _safe_str(rows[0].get("id"))
         except Exception:
@@ -364,7 +360,6 @@ def _support_get_or_create_session(user_id: str, session_id: str | None) -> str 
                 "select": "id,updated_at,status",
                 "user_id": f"eq.{uid}",
                 "status": "eq.open",
-                "updated_at": f"gte.{today_start}",
                 "order": "updated_at.desc",
                 "limit": "1",
             },
@@ -3796,4 +3791,3 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
-
