@@ -8,6 +8,7 @@ import random
 import re
 import uuid
 import hashlib
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -248,8 +249,113 @@ def _support_bot_offered_human_recently(text: str) -> bool:
         or ("parler à un humain" in s)
         or ("parler a un humain" in s)
         or ("mettre en relation" in s)
+        or ("human agent" in s)
+        or ("talk to a human" in s)
+        or ("human support" in s)
+        or ("agente humano" in s)
+        or ("hablar con un humano" in s)
+        or ("mit einem mensch" in s)
+        or ("menschlichen" in s and "agent" in s)
+        or ("parlare con un umano" in s)
+        or ("menselijke" in s and "agent" in s)
         or ("souhaitez-vous" in s and "humain" in s)
     )
+
+def _support_lang_from_locale(locale: str) -> str:
+    loc = _safe_str(locale).strip().lower()
+    if not loc:
+        return ""
+    primary = re.split(r"[_-]", loc)[0].strip()
+    if primary in {"fr", "en", "es", "de", "it", "nl", "pt"}:
+        return primary
+    return ""
+
+def _support_detect_user_language(text: str, locale: str | None = None) -> str:
+    hint = _support_lang_from_locale(_safe_str(locale))
+    s = re.sub(r"\s+", " ", _safe_str(text).lower()).strip()
+    if not s:
+        return hint or "fr"
+
+    scores = {k: 0 for k in ["fr", "en", "es", "de", "it", "nl", "pt"]}
+    if hint in scores:
+        scores[hint] += 2
+
+    fr_words = ["bonjour", "merci", "mot de passe", "compte", "je", "j'ai", "ça", "probleme", "problème", "aide", "connexion"]
+    en_words = ["hello", "thanks", "password", "account", "i", "i'm", "can't", "cannot", "help", "login", "sign in"]
+    es_words = ["hola", "gracias", "contraseña", "cuenta", "no puedo", "ayuda", "iniciar sesión", "iniciar sesion"]
+    de_words = ["hallo", "danke", "passwort", "konto", "ich", "hilfe", "anmelden", "einloggen"]
+    it_words = ["ciao", "grazie", "password", "account", "aiuto", "accesso", "accedere"]
+    nl_words = ["hallo", "dank", "wachtwoord", "account", "help", "inloggen"]
+    pt_words = ["olá", "ola", "obrigado", "senha", "conta", "ajuda", "entrar", "login"]
+
+    def bump(lang: str, words: list[str]) -> None:
+        for w in words:
+            if w in s:
+                scores[lang] += 1
+
+    bump("fr", fr_words)
+    bump("en", en_words)
+    bump("es", es_words)
+    bump("de", de_words)
+    bump("it", it_words)
+    bump("nl", nl_words)
+    bump("pt", pt_words)
+
+    best = max(scores.items(), key=lambda kv: kv[1])[0]
+    if scores[best] == 0:
+        return hint or "fr"
+    return best
+
+def _support_i18n(lang: str, key: str) -> str:
+    l = _safe_str(lang).strip().lower() or "fr"
+    t = {
+        "offer_human": {
+            "fr": "Je peux vous mettre en relation avec un agent humain. Souhaitez-vous ?",
+            "en": "I can connect you with a human agent. Would you like that?",
+            "es": "Puedo ponerte en contacto con un agente humano. ¿Quieres que lo haga?",
+            "de": "Ich kann Sie mit einem menschlichen Support-Agenten verbinden. Möchten Sie das?",
+            "it": "Posso metterti in contatto con un agente umano. Vuoi che lo faccia?",
+            "nl": "Ik kan je in contact brengen met een menselijke agent. Wil je dat?",
+            "pt": "Posso colocar você em contato com um atendente humano. Você quer?",
+        },
+        "human_opened": {
+            "fr": "Merci, je vous mets en relation avec un agent humain. Vous recevrez une réponse ici dès que possible.",
+            "en": "Thanks — I’m connecting you with a human agent. You’ll get a reply here as soon as possible.",
+            "es": "Gracias — te pongo en contacto con un agente humano. Recibirás una respuesta aquí lo antes posible.",
+            "de": "Danke — ich verbinde Sie mit einem menschlichen Agenten. Sie erhalten hier so schnell wie möglich eine Antwort.",
+            "it": "Grazie — ti metto in contatto con un agente umano. Riceverai una risposta qui il prima possibile.",
+            "nl": "Bedankt — ik breng je in contact met een menselijke agent. Je krijgt hier zo snel mogelijk antwoord.",
+            "pt": "Obrigado — vou te colocar em contato com um atendente humano. Você receberá uma resposta aqui o mais rápido possível.",
+        },
+        "human_unavailable": {
+            "fr": "Je n’arrive pas à vous mettre en relation avec un agent humain pour le moment. Réessayez plus tard.",
+            "en": "I can’t connect you with a human agent right now. Please try again later.",
+            "es": "Ahora mismo no puedo ponerte en contacto con un agente humano. Inténtalo más tarde.",
+            "de": "Ich kann Sie im Moment nicht mit einem menschlichen Agenten verbinden. Bitte versuchen Sie es später erneut.",
+            "it": "Al momento non riesco a metterti in contatto con un agente umano. Riprova più tardi.",
+            "nl": "Ik kan je op dit moment niet met een menselijke agent verbinden. Probeer het later opnieuw.",
+            "pt": "No momento não consigo te colocar em contato com um atendente humano. Tente novamente mais tarde.",
+        },
+        "ticket_limit": {
+            "fr": "Vous avez déjà 3 demandes de support en attente. Merci d’attendre une réponse avant d’en ouvrir une nouvelle.",
+            "en": "You already have 3 open support requests. Please wait for a reply before opening a new one.",
+            "es": "Ya tienes 3 solicitudes de soporte abiertas. Espera una respuesta antes de abrir otra.",
+            "de": "Sie haben bereits 3 offene Support-Anfragen. Bitte warten Sie auf eine Antwort, bevor Sie eine neue eröffnen.",
+            "it": "Hai già 3 richieste di supporto aperte. Attendi una risposta prima di aprirne un’altra.",
+            "nl": "Je hebt al 3 open supportverzoeken. Wacht op een antwoord voordat je een nieuwe opent.",
+            "pt": "Você já tem 3 solicitações de suporte abertas. Aguarde uma resposta antes de abrir uma nova.",
+        },
+        "image_received": {
+            "fr": "J’ai bien reçu l’image. Je ne peux pas l’analyser automatiquement ici. Si vous voulez, je peux vous mettre en relation avec un agent humain.",
+            "en": "I received the image. I can’t automatically analyze it here. If you want, I can connect you with a human agent.",
+            "es": "He recibido la imagen. No puedo analizarla automáticamente aquí. Si quieres, puedo ponerte en contacto con un agente humano.",
+            "de": "Ich habe das Bild erhalten. Ich kann es hier nicht automatisch analysieren. Wenn Sie möchten, kann ich Sie mit einem menschlichen Agenten verbinden.",
+            "it": "Ho ricevuto l’immagine. Non posso analizzarla automaticamente qui. Se vuoi, posso metterti in contatto con un agente umano.",
+            "nl": "Ik heb de afbeelding ontvangen. Ik kan die hier niet automatisch analyseren. Als je wilt, kan ik je met een menselijke agent verbinden.",
+            "pt": "Recebi a imagem. Não consigo analisá-la automaticamente aqui. Se você quiser, posso te colocar em contato com um atendente humano.",
+        },
+    }
+    return (t.get(key) or {}).get(l) or (t.get(key) or {}).get("fr") or ""
 
 def _support_last_bot_asked_human(ticket_id: str) -> bool:
     try:
@@ -481,6 +587,25 @@ def _support_get_or_create_session(user_id: str, session_id: str | None) -> str 
     if isinstance(created, dict) and created.get("session_id"):
         return _safe_str(created.get("session_id"))
     return None
+
+def _support_open_human_ticket_count(user_id: str) -> int:
+    uid = _safe_str(user_id).strip()
+    if not uid or uid == "anonymous":
+        return 0
+    try:
+        rows = _supabase_get(
+            "support_chat_tickets",
+            params={
+                "select": "id",
+                "user_id": f"eq.{uid}",
+                "needs_human": "eq.true",
+                "status": "in.(ouvert,en_cours)",
+            },
+            timeout_s=5,
+        )
+        return len(rows or [])
+    except Exception:
+        return 0
 
 def _safe_str(value) -> str:
     if value is None:
@@ -1205,7 +1330,22 @@ def _pick_top_offers(items, limit: int) -> list[dict]:
     return out
 
 
+def _stable_pick_index(seed: str, n: int) -> int:
+    if n <= 0:
+        return 0
+    h = hashlib.sha256(_safe_str(seed).encode("utf-8")).hexdigest()
+    v = int(h[:12], 16) if h else 0
+    return v % n
+
+
+def _stable_choice(seed: str, options: list[str]) -> str:
+    if not options:
+        return ""
+    return options[_stable_pick_index(seed, len(options))]
+
+
 def _fallback_notification_message(payload: dict) -> dict:
+    user_id = _safe_str(payload.get("user_id")).strip() or "unknown"
     personalization = payload.get("personalization")
     if not isinstance(personalization, dict):
         personalization = {}
@@ -1232,14 +1372,58 @@ def _fallback_notification_message(payload: dict) -> dict:
             if len(body) > 400:
                 body = body[:397] + "..."
             points_bit = f" • Gagne {t_points} Points" if t_points > 0 else ""
-            return {"kind": "success", "title": f"Offre recommandée : {t_title}", "body": body + points_bit}
+            title_tpl = _stable_choice(
+                f"{user_id}:notif:offer:title:{t_title}",
+                [
+                    "Offre recommandée : {t}",
+                    "À ne pas rater : {t}",
+                    "Bon plan du moment : {t}",
+                    "Défi rapide : {t}",
+                    "Gros gain possible : {t}",
+                    "Suggestion du jour : {t}",
+                ],
+            )
+            body_tpl = _stable_choice(
+                f"{user_id}:notif:offer:body:{t_title}:{t_points}",
+                [
+                    "{d}{p} • Lance-la maintenant",
+                    "{d}{p} • Objectif: valider et encaisser",
+                    "{d}{p} • Prêt à booster tes points ?",
+                    "{d}{p} • Clique, complète, récupère tes points",
+                    "{d}{p} • Plus tu avances, plus tu gagnes",
+                ],
+            )
+            resolved_title = (title_tpl or "Offre recommandée : {t}").format(t=t_title).strip()
+            resolved_body = (body_tpl or "{d}{p}").format(d=body, p=points_bit).strip()
+            return {"kind": "success", "title": resolved_title, "body": resolved_body}
         if t_type == "survey":
             title = t_title or "Sondage"
             body = (t_desc or title).replace("\n", " ").strip()
             if len(body) > 400:
                 body = body[:397] + "..."
             points_bit = f" • Gagne {t_points} Points" if t_points > 0 else ""
-            return {"kind": "success", "title": f"Sondage recommandé : {title}", "body": body + points_bit}
+            title_tpl = _stable_choice(
+                f"{user_id}:notif:survey:title:{title}",
+                [
+                    "Sondage recommandé : {t}",
+                    "Sondage rapide : {t}",
+                    "À faire aujourd’hui : {t}",
+                    "Bonus sondage : {t}",
+                    "Suggestion : {t}",
+                ],
+            )
+            body_tpl = _stable_choice(
+                f"{user_id}:notif:survey:body:{title}:{t_points}",
+                [
+                    "{d}{p} • Réponds et gagne",
+                    "{d}{p} • Quelques minutes, des points",
+                    "{d}{p} • Profil complet = plus de sondages",
+                    "{d}{p} • Fais-le maintenant",
+                ],
+            )
+            resolved_title = (title_tpl or "Sondage recommandé : {t}").format(t=title).strip()
+            resolved_body = (body_tpl or "{d}{p}").format(d=body, p=points_bit).strip()
+            return {"kind": "success", "title": resolved_title, "body": resolved_body}
 
     if reason == "survey-heavy":
         body = f"Priorité: {', '.join([s.upper() for s in top_surveys])}." if top_surveys else "On a repéré que tu préfères les sondages en ce moment."
@@ -1247,10 +1431,24 @@ def _fallback_notification_message(payload: dict) -> dict:
 
     if reason == "offer-heavy":
         if top_offers:
-            body = " • ".join([f"{o.get('title')} (+{o.get('payout_points')})" for o in top_offers if _safe_str(o.get("title")).strip()])
+            body_tpl = _stable_choice(
+                f"{user_id}:notif:offer-heavy:{top_offers[0].get('offer_id')}",
+                [
+                    "À tester aujourd’hui: {items}",
+                    "Deux offres à gros potentiel: {items}",
+                    "Objectif du jour: {items}",
+                    "Sélection du moment: {items}",
+                ],
+            )
+            items_txt = " • ".join([f"{o.get('title')} (+{o.get('payout_points')})" for o in top_offers if _safe_str(o.get("title")).strip()])
+            body = (body_tpl or "{items}").format(items=items_txt).strip()
         else:
             body = "On a repéré que tu préfères les offres en ce moment."
-        return {"kind": "success", "title": "Offres recommandées aujourd’hui", "body": body or "Offres recommandées aujourd’hui."}
+        title_tpl = _stable_choice(
+            f"{user_id}:notif:offer-heavy:title",
+            ["Offres recommandées", "Suggestions d’offres", "Offres du moment", "Bonnes offres à faire"],
+        )
+        return {"kind": "success", "title": title_tpl or "Offres recommandées", "body": body or "Offres recommandées aujourd’hui."}
 
     bits: list[str] = []
     if top_surveys[:1]:
@@ -2577,7 +2775,136 @@ def recommend_offers_internal(
     device: str | None = None,
     mix: dict | None = None,
 ) -> list[dict]:
-    return []
+    try:
+        limit_int = max(1, safe_int(limit, 6))
+    except Exception:
+        limit_int = 6
+
+    now = datetime.now(timezone.utc)
+    since_global = _to_iso(now - timedelta(days=45))
+    since_user = _to_iso(now - timedelta(days=120))
+
+    try:
+        user_rows = _supabase_get_first_success(
+            "transaction_offers",
+            variants=[
+                {
+                    "select": "offer_id,created_at,status",
+                    "user_id": f"eq.{user_id}",
+                    "status": "eq.1",
+                    "created_at": f"gte.{since_user}",
+                    "order": "created_at.desc",
+                    "limit": "2000",
+                },
+                {
+                    "select": "offer_id,status",
+                    "user_id": f"eq.{user_id}",
+                    "status": "eq.1",
+                    "limit": "2000",
+                },
+            ],
+            timeout_s=18,
+        )
+    except Exception:
+        user_rows = []
+
+    already_done: set[str] = set()
+    for r in user_rows:
+        if not isinstance(r, dict):
+            continue
+        oid = _safe_str(r.get("offer_id")).strip()
+        if oid:
+            already_done.add(oid)
+
+    try:
+        global_rows = _supabase_get_first_success(
+            "transaction_offers",
+            variants=[
+                {
+                    "select": "offer_id,offer_name,points,provider,created_at,status",
+                    "status": "eq.1",
+                    "created_at": f"gte.{since_global}",
+                    "order": "created_at.desc",
+                    "limit": "4000",
+                },
+                {"select": "offer_id,offer_name,points,provider,status", "status": "eq.1", "limit": "4000"},
+            ],
+            timeout_s=22,
+        )
+    except Exception:
+        global_rows = []
+
+    agg: dict[str, dict] = {}
+    for r in global_rows:
+        if not isinstance(r, dict):
+            continue
+        oid = _safe_str(r.get("offer_id")).strip()
+        if not oid:
+            continue
+        if oid in already_done:
+            continue
+        pts = safe_int(r.get("points"), 0)
+        if pts <= 0:
+            continue
+        name = _safe_str(r.get("offer_name")).strip()
+        provider = _safe_str(r.get("provider")).strip().lower()
+        a = agg.get(oid)
+        if not a:
+            a = {
+                "offer_id": oid,
+                "title": name or oid,
+                "provider": provider,
+                "count": 0,
+                "sum_points": 0,
+                "max_points": 0,
+            }
+            agg[oid] = a
+        a["count"] = int(a.get("count", 0)) + 1
+        a["sum_points"] = int(a.get("sum_points", 0)) + pts
+        a["max_points"] = max(int(a.get("max_points", 0)), pts)
+        if name and (a.get("title") == oid or len(_safe_str(a.get("title"))) < 6):
+            a["title"] = name
+
+    if not agg:
+        return []
+
+    max_count = max(int(v.get("count", 0)) for v in agg.values()) or 1
+    max_points = max(int(v.get("max_points", 0)) for v in agg.values()) or 1
+
+    items: list[dict] = []
+    for v in agg.values():
+        count = int(v.get("count", 0))
+        pts = int(v.get("max_points", 0)) or int(v.get("sum_points", 0) / max(1, count))
+        if pts < 200:
+            continue
+        score_pop = float(count) / float(max_count) if max_count > 0 else 0.0
+        score_pts = float(pts) / float(max_points) if max_points > 0 else 0.0
+        score = clamp01(0.65 * score_pop + 0.35 * score_pts)
+        reason = "Populaire en ce moment"
+        if score_pts > 0.7 and score_pop > 0.35:
+            reason = "Très demandé et bon gain"
+        elif score_pts > 0.7:
+            reason = "Bon gain"
+        elif score_pop > 0.5:
+            reason = "Très demandé"
+        items.append(
+            {
+                "offer_id": _safe_str(v.get("offer_id")).strip(),
+                "title": _safe_str(v.get("title")).strip(),
+                "payout_points": pts,
+                "score": round(float(score), 4),
+                "reason": reason,
+            }
+        )
+
+    items.sort(key=lambda x: (float(x.get("score", 0.0)), safe_int(x.get("payout_points"), 0)), reverse=True)
+
+    month_key = now.strftime("%Y-%m")
+    seed_int = int(hashlib.sha256(f"{user_id}:{month_key}:offers".encode("utf-8")).hexdigest()[:12], 16)
+    rng = random.Random(seed_int)
+    pool = items[:60]
+    rng.shuffle(pool)
+    return pool[:limit_int]
 
 
 @app.get("/recommendations/{user_id}")
@@ -2685,7 +3012,7 @@ def get_personalization(
     iframes_limit = 3
 
     offers: list[dict] = []
-    if (not startup_error) and ("index" in resources) and ("offers_meta" in resources):
+    if not startup_error:
         try:
             offers = recommend_offers_internal(
                 user_id=user_id,
@@ -2696,6 +3023,21 @@ def get_personalization(
             )
         except Exception:
             offers = []
+
+    try:
+        now = datetime.now(timezone.utc)
+        month_key = now.strftime("%Y-%m")
+        h = int(hashlib.sha256(f"{user_id}:{month_key}:offer-push".encode("utf-8")).hexdigest()[:12], 16)
+        d1 = min(28, 3 + (h % 6))
+        d2 = min(28, 17 + ((h // 7) % 6))
+        push_days = {d1, d2}
+        if offers and now.day in push_days:
+            mix = dict(mix or {})
+            mix["reason"] = "offer-heavy"
+            mix["offers_weight"] = max(0.75, float(mix.get("offers_weight", 0.5)))
+            mix["surveys_weight"] = min(0.25, float(mix.get("surveys_weight", 0.5)))
+    except Exception:
+        pass
 
     try:
         surveys = recommend_survey_providers(user_id=user_id, limit=surveys_limit, mix=mix)
@@ -3473,6 +3815,8 @@ async def support_chat(request: Request):
         user_id = _safe_str(body.get("user_id")).strip()
         message = _safe_str(body.get("message")).strip()
         session_id = _safe_str(body.get("session_id")).strip()
+        attachments = body.get("attachments")
+        locale = _safe_str(body.get("locale")).strip()
         
         if not user_id or not message:
             # Fallback si user_id manque (mode démo ou déconnecté)
@@ -3481,6 +3825,7 @@ async def support_chat(request: Request):
             else:
                 raise HTTPException(status_code=400, detail="user_id and message required")
 
+        reply_lang = _support_detect_user_language(message, locale)
         resolved_session_id = _support_get_or_create_session(user_id, session_id)
         if resolved_session_id:
             try:
@@ -3491,6 +3836,7 @@ async def support_chat(request: Request):
                         "user_id": user_id,
                         "sender": "user",
                         "message": message,
+                        "attachments": attachments if isinstance(attachments, list) else None,
                     },
                     timeout_s=5,
                 )
@@ -3505,6 +3851,14 @@ async def support_chat(request: Request):
                 )
 
             if resolved_session_id and wants_human:
+                if _support_open_human_ticket_count(user_id) >= 3:
+                    text = _support_i18n(reply_lang, "ticket_limit")
+                    return {
+                        "response": text,
+                        "source": "human_ticket_error",
+                        "session_id": resolved_session_id,
+                        "suppress_bot_message": True,
+                    }
                 try:
                     allowed = _supabase_rpc(
                         "can_open_human_support_ticket",
@@ -3518,9 +3872,9 @@ async def support_chat(request: Request):
                 except Exception as e:
                     msg = _safe_str(e)
                     if "ticket_limit_reached" in msg:
-                        text = "Vous avez déjà des demandes de support en attente. Merci d’attendre une réponse avant d’en ouvrir une nouvelle."
+                        text = _support_i18n(reply_lang, "ticket_limit")
                     else:
-                        text = "Je n’arrive pas à vous mettre en relation avec un agent humain pour le moment. Réessayez plus tard."
+                        text = _support_i18n(reply_lang, "human_unavailable")
                     return {
                         "response": text,
                         "source": "human_ticket_error",
@@ -3564,7 +3918,7 @@ async def support_chat(request: Request):
                         session_msgs = _supabase_get(
                             "support_chat_session_messages",
                             params={
-                                "select": "sender,message,created_at",
+                                "select": "sender,message,created_at,attachments",
                                 "session_id": f"eq.{resolved_session_id}",
                                 "order": "created_at.asc",
                                 "limit": "200",
@@ -3576,6 +3930,8 @@ async def support_chat(request: Request):
                                 continue
                             sender = _safe_str(r.get("sender")).lower()
                             msg = _safe_str(r.get("message"))
+                            atts = r.get("attachments")
+                            att_list = (atts if isinstance(atts, list) else [])
                             if not msg:
                                 continue
                             _supabase_post(
@@ -3586,7 +3942,7 @@ async def support_chat(request: Request):
                                     "message": msg,
                                     "is_admin": True if sender == "bot" else False,
                                     "sender": "bot" if sender == "bot" else "user",
-                                    "attachments": [],
+                                    "attachments": att_list if att_list else [],
                                 },
                                 timeout_s=5,
                             )
@@ -3600,7 +3956,7 @@ async def support_chat(request: Request):
                             {
                                 "ticket_id": new_ticket_id,
                                 "user_id": user_id,
-                                "message": "Merci, je vous mets en relation avec un agent humain. Vous recevrez une réponse ici dès que possible.",
+                                "message": _support_i18n(reply_lang, "human_opened"),
                                 "is_admin": True,
                                 "sender": "bot",
                                 "attachments": [],
@@ -3622,7 +3978,7 @@ async def support_chat(request: Request):
                         pass
 
                 return {
-                    "response": "Merci, je vous mets en relation avec un agent humain. Vous recevrez une réponse ici dès que possible.",
+                    "response": _support_i18n(reply_lang, "human_opened"),
                     "source": "human_ticket_opened",
                     "ticket_id": new_ticket_id,
                     "suppress_bot_message": True,
@@ -3827,7 +4183,8 @@ async def support_chat(request: Request):
             "    - Si l'utilisateur n'arrive pas à se connecter : guider vers **Mot de passe oublié ?** (page /forgot-password) puis lien reçu (page /reset-password).\n"
             "    - Si l'utilisateur est connecté et veut changer : guider vers la section mot de passe du **Profil**.\n"
             "18. Réponses courtes : va droit au but. Ne récite pas tout l'historique.\n"
-            "Réponds en français.\n\n"
+            f"19. Réponds dans la langue de l'utilisateur. Langue attendue: {reply_lang}.\n"
+            "20. Si l'utilisateur a joint une image, ne devine pas ce qu'elle contient. Dis que tu l'as reçue et propose un agent humain si nécessaire.\n\n"
             f"--- DEBUG LOGS (Pour info technique seulement, ne pas citer à l'utilisateur sauf s'il demande des détails techniques) ---\n{debug_logs_str}"
         )
         
@@ -3846,12 +4203,14 @@ async def support_chat(request: Request):
             }
             
         content = llm.get("content", "")
+        if isinstance(attachments, list) and len(attachments) > 0:
+            content = _support_i18n(reply_lang, "image_received") + "\n\n" + _safe_str(content).strip()
         should_force_human_offer = (not is_first_turn) and (user_turns >= 2) and _support_user_seems_blocked(message)
         if should_force_human_offer and not _support_bot_offered_human_recently(content):
             content = _safe_str(content).rstrip()
             if content:
                 content += "\n\n"
-            content += "Je peux vous mettre en relation avec un agent humain. Souhaitez-vous ?"
+            content += _support_i18n(reply_lang, "offer_human")
         if resolved_session_id:
             try:
                 _supabase_post(
@@ -3861,6 +4220,7 @@ async def support_chat(request: Request):
                         "user_id": user_id,
                         "sender": "bot",
                         "message": _safe_str(content),
+                        "attachments": None,
                     },
                     timeout_s=5,
                 )
@@ -3908,4 +4268,3 @@ async def internal_quiz_generate(request: Request):
         fallback["llm"] = _llm_status()
         fallback["llm_error"] = resources.get("last_llm_error") or ""
     return fallback
-
