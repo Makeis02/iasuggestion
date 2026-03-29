@@ -1593,7 +1593,7 @@ def _iframe_provider_fallback(limit: int) -> list[dict]:
 
 
 def _offerwall_provider_fallback(limit: int) -> list[dict]:
-    fallback = ["revlum", "kiwiwall", "notik"]
+    fallback = ["revlum", "kiwiwall", "opinionuniverse", "notik"]
     items: list[dict] = []
     for p in fallback[: max(0, int(limit))]:
         items.append({"provider": p, "score": 0.5, "reason": "fallback", "entry": p})
@@ -1611,14 +1611,19 @@ def _normalize_offerwall_provider(value: str | None) -> str | None:
         "rev": "revlum",
         "rev-lum": "revlum",
         "rev_lum": "revlum",
+        "opinion": "opinionuniverse",
+        "opinion-universe": "opinionuniverse",
+        "opinion_universe": "opinionuniverse",
     }
     s = aliases.get(s, s)
-    if s in {"revlum", "kiwiwall", "notik", "mylead", "wannads"}:
+    if s in {"revlum", "kiwiwall", "opinionuniverse", "notik", "mylead", "wannads"}:
         return s
     if "revlum" in s:
         return "revlum"
     if "kiwi" in s:
         return "kiwiwall"
+    if "opinion" in s:
+        return "opinionuniverse"
     if "notik" in s:
         return "notik"
     if "mylead" in s:
@@ -1636,7 +1641,7 @@ def _compute_offerwall_provider_recommendations(user_id: str, limit: int = 3) ->
     except Exception:
         limit_int = 3
 
-    candidates = {"revlum", "kiwiwall", "notik"}
+    candidates = {"revlum", "kiwiwall", "opinionuniverse", "notik"}
     now = datetime.now(timezone.utc)
     since_impressions = _to_iso(now - timedelta(days=30))
     since_history = _to_iso(now - timedelta(days=60))
@@ -2033,7 +2038,7 @@ def _compute_iframe_provider_recommendations(user_id: str, limit: int = 3) -> li
 def compute_user_mode(user_id: str) -> dict:
     from datetime import datetime, timedelta, timezone
 
-    survey_providers = {"cpx", "rapidoreach", "theoremreach", "bitlabs", "notik"}
+    survey_providers = {"cpx", "rapidoreach", "theoremreach", "bitlabs", "notik", "opinionuniverse"}
     ignored_providers = {"page_load", "iframe", "unknown", "adgem", "wannads"}
 
     now = datetime.now(timezone.utc)
@@ -2183,9 +2188,9 @@ def recommend_survey_providers(user_id: str, limit: int = 4, mix: dict | None = 
         limit_int = 4
 
     ignored_providers = {"page_load", "iframe", "unknown"}
-    allowed_providers = {"cpx", "rapidoreach", "theoremreach", "bitlabs", "notik"}
+    allowed_providers = {"cpx", "rapidoreach", "theoremreach", "bitlabs", "notik", "opinionuniverse"}
     fast_providers = {"cpx", "bitlabs"}
-    fallback = ["cpx", "rapidoreach", "theoremreach", "bitlabs"]
+    fallback = ["cpx", "rapidoreach", "theoremreach", "bitlabs", "opinionuniverse"]
 
     now = datetime.now(timezone.utc)
     since_impressions = _to_iso(now - timedelta(days=30))
