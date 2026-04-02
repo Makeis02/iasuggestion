@@ -11,6 +11,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit, parse_qs
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -1343,9 +1344,58 @@ def _stable_choice(seed: str, options: list[str]) -> str:
         return ""
     return options[_stable_pick_index(seed, len(options))]
 
+ACTIVE_SURVEY_PROVIDERS = {"cpx", "rapidoreach", "ayet"}
+
+def _provider_label(provider: str) -> str:
+    p = _safe_str(provider).strip().lower()
+    if p == "cpx":
+        return "CPX Research"
+    if p == "rapidoreach":
+        return "RapidoReach"
+    if p == "ayet":
+        return "ayeT-Studios"
+    if p == "timewall":
+        return "TimeWall"
+    if p == "theoremreach":
+        return "TheoremReach"
+    if p == "bitcotasks":
+        return "BitcoTasks"
+    if p == "offery":
+        return "Offery"
+    if p == "adgem":
+        return "AdGem"
+    if p == "opinionuniverse":
+        return "OpinionUniverse"
+    return p.upper() if p else ""
+
+def _notif_focus_from_action_url(action_url: str) -> dict | None:
+    s = _safe_str(action_url).strip()
+    if not s:
+        return None
+    try:
+        parsed = urlsplit(s)
+        path = _safe_str(parsed.path).strip() or s.split("?")[0]
+        q = parse_qs(parsed.query or "")
+        if path == "/sondages":
+            provider = _safe_str((q.get("provider") or [""])[0]).strip().lower()
+            if provider and provider in ACTIVE_SURVEY_PROVIDERS:
+                return {"kind": "survey_provider", "provider": provider}
+            return None
+        if path == "/offres":
+            tab = _safe_str((q.get("tab") or [""])[0]).strip().lower()
+            iframe_id = _safe_str((q.get("iframeId") or [""])[0]).strip().lower()
+            if tab == "integrated" and iframe_id:
+                return {"kind": "iframe_provider", "provider": iframe_id}
+            return None
+        return None
+    except Exception:
+        return None
+
 
 def _fallback_notification_message(payload: dict) -> dict:
     user_id = _safe_str(payload.get("user_id")).strip() or "unknown"
+    action_url = _safe_str(payload.get("action_url")).strip()
+    focus = _notif_focus_from_action_url(action_url)
     personalization = payload.get("personalization")
     if not isinstance(personalization, dict):
         personalization = {}
@@ -1360,6 +1410,24 @@ def _fallback_notification_message(payload: dict) -> dict:
     top_offerwalls = _pick_top_providers((providers.get("offerwalls") or []), 1)
     top_iframes = _pick_top_providers((providers.get("iframes") or []), 1)
     top_offers = _pick_top_offers((personalization.get("offers") or []), 2)
+
+    if focus and focus.get("kind") == "survey_provider":
+        p = _safe_str(focus.get("provider")).strip().lower()
+        if p in ACTIVE_SURVEY_PROVIDERS:
+            return {
+                "kind": "info",
+                "title": "Nouveau sondage disponible",
+                "body": f"Réponds au mur de sondages {_provider_label(p)} et gagne des points.",
+            }
+
+    if focus and focus.get("kind") == "iframe_provider":
+        p = _safe_str(focus.get("provider")).strip().lower()
+        if p:
+            return {
+                "kind": "info",
+                "title": "Nouvelles offres disponibles",
+                "body": f"Découvre les offres via {_provider_label(p)} et gagne des points.",
+            }
 
     target = payload.get("target")
     if isinstance(target, dict):
@@ -1482,7 +1550,7 @@ def _generate_notification_message_llm(payload: dict) -> dict | None:
     providers = personalization.get("providers")
     if not isinstance(providers, dict):
         providers = {}
-    top_surveys = _pick_top_providers((providers.get("surveys") or []), 2)
+    top_surveys = [p for p in _pick_top_providers((providers.get("surveys") or []), 6) if _safe_str(p).strip().lower() in ACTIVE_SURVEY_PROVIDERS][:2]
     top_offerwalls = _pick_top_providers((providers.get("offerwalls") or []), 1)
     top_iframes = _pick_top_providers((providers.get("iframes") or []), 1)
     top_offers = _pick_top_offers((personalization.get("offers") or []), 2)
@@ -1490,12 +1558,27 @@ def _generate_notification_message_llm(payload: dict) -> dict | None:
     action_url = _safe_str(payload.get("action_url")).strip()
     target = payload.get("target") if isinstance(payload.get("target"), dict) else {}
     explore = payload.get("explore") if isinstance(payload.get("explore"), dict) else {}
+    focus = _notif_focus_from_action_url(action_url)
 
     sys_prompt = (
         "Tu écris une notification pour une app de rewards (points, offres, sondages). "
         "Langue: français. Ton: direct et motivant. "
         "Réponds UNIQUEMENT en JSON valide, sans texte autour."
     )
+    if focus and focus.get("kind") == "survey_provider":
+        p = _safe_str(focus.get("provider")).strip().lower()
+        if p in ACTIVE_SURVEY_PROVIDERS:
+            sys_prompt += (
+                f" IMPORTANT: tu dois parler UNIQUEMENT du prestataire {_provider_label(p)}. "
+                "Ne cite aucun autre prestataire, aucun offerwall, aucun iframe, aucun nom d’offre."
+            )
+    if focus and focus.get("kind") == "iframe_provider":
+        p = _safe_str(focus.get("provider")).strip().lower()
+        if p:
+            sys_prompt += (
+                f" IMPORTANT: tu dois parler UNIQUEMENT de {_provider_label(p)}. "
+                "Ne cite aucun autre prestataire, aucun mur de sondages, aucun nom d’offre."
+            )
     user_prompt = (
         "Génère un message de notification personnalisé pour l'utilisateur.\n"
         "Contraintes:\n"
@@ -1509,7 +1592,7 @@ def _generate_notification_message_llm(payload: dict) -> dict | None:
         f"Top offers: {', '.join([_safe_str(o.get('title')) for o in top_offers if _safe_str(o.get('title')).strip()]) or 'none'}\n"
         f"Top offerwalls: {', '.join(top_offerwalls) if top_offerwalls else 'none'}\n"
         f"Top iframes: {', '.join(top_iframes) if top_iframes else 'none'}\n"
-        f"Explore survey_provider: {_safe_str(explore.get('survey_provider')).strip()}\n"
+        f"Explore survey_provider: {_safe_str(explore.get('survey_provider')).strip() if _safe_str(explore.get('survey_provider')).strip().lower() in ACTIVE_SURVEY_PROVIDERS else ''}\n"
         f"Explore offer_provider: {_safe_str(explore.get('offer_provider')).strip()}\n"
         f"Target type: {_safe_str(target.get('type')).strip()}\n"
         f"Target title: {_safe_str(target.get('title')).strip()}\n"
