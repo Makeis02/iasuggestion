@@ -2498,6 +2498,34 @@ def _bearer_token(request: Request) -> str:
     return token
 
 
+def _require_user(request: Request) -> dict:
+    token = _bearer_token(request)
+    supabase_url = os.environ.get("SUPABASE_URL")
+    if not supabase_url:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL manquant côté serveur")
+
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail="SUPABASE_SERVICE_ROLE_KEY ou SUPABASE_ANON_KEY manquant côté serveur",
+        )
+
+    auth_resp = requests.get(
+        f"{supabase_url.rstrip('/')}/auth/v1/user",
+        headers={"apikey": key, "Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    if auth_resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Session invalide ou expirée")
+    user = auth_resp.json() or {}
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Session invalide (id absent)")
+
+    return user
+
+
 def _require_admin(request: Request) -> str:
     token = _bearer_token(request)
     supabase_url = os.environ.get("SUPABASE_URL")
@@ -3179,6 +3207,168 @@ def get_offerwall_provider_recommendations(user_id: str, limit: int = 3):
     except Exception:
         items = _offerwall_provider_fallback(limit)
     return {"user_id": user_id, "items": items}
+
+
+@app.get("/offer-progress-notifications")
+async def offer_progress_notifications(request: Request, limit: int = 3, lookback_days: int = 14):
+    user = _require_user(request)
+    user_id = _safe_str(user.get("id")).strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Session invalide (id absent)")
+
+    def _pg_in(values: list[str]) -> str:
+        cleaned: list[str] = []
+        for v in values:
+            s = _safe_str(v).strip()
+            if not s:
+                continue
+            s = s.replace('"', '""')
+            cleaned.append(f'"{s}"')
+        if not cleaned:
+            return "in.()"
+        return f"in.({','.join(cleaned)})"
+
+    now = datetime.now(timezone.utc)
+    since_iso = (now - timedelta(days=max(1, min(int(lookback_days), 60)))).isoformat()
+
+    try:
+        tracking_rows = _supabase_get(
+            "offer_tracking",
+            params={
+                "select": "offer_id,metadata,created_at,action_type,status",
+                "user_id": f"eq.{user_id}",
+                "created_at": f"gte.{since_iso}",
+                "order": "created_at.desc",
+                "limit": "200",
+            },
+            timeout_s=12,
+        )
+    except Exception:
+        tracking_rows = []
+
+    latest_by_offer: dict[str, dict] = {}
+    for row in tracking_rows:
+        oid = _safe_str(row.get("offer_id")).strip()
+        if not oid:
+            continue
+        if oid in latest_by_offer:
+            continue
+        latest_by_offer[oid] = row
+
+    offer_ids = list(latest_by_offer.keys())[:80]
+    if not offer_ids:
+        return {"user_id": user_id, "notifications": []}
+
+    try:
+        tx_rows = _supabase_get(
+            "transaction_offers",
+            params={
+                "select": "offer_id,type,status,event_id,event_name,created_at,points",
+                "user_id": f"eq.{user_id}",
+                "status": "eq.1",
+                "offer_id": _pg_in(offer_ids),
+                "order": "created_at.desc",
+                "limit": "800",
+            },
+            timeout_s=12,
+        )
+    except Exception:
+        tx_rows = []
+
+    completed_by_offer: dict[str, dict] = {}
+    for tx in tx_rows:
+        oid = _safe_str(tx.get("offer_id")).strip()
+        if not oid:
+            continue
+        bucket = completed_by_offer.get(oid)
+        if not bucket:
+            bucket = {"install": False, "event_ids": set(), "event_names": set()}
+            completed_by_offer[oid] = bucket
+        ttype = _safe_str(tx.get("type")).strip().lower()
+        if ttype == "install":
+            bucket["install"] = True
+        eid = _safe_str(tx.get("event_id")).strip()
+        if eid:
+            bucket["event_ids"].add(eid)
+        ename = _safe_str(tx.get("event_name")).strip().lower()
+        if ename:
+            bucket["event_names"].add(ename)
+
+    out: list[dict] = []
+    for offer_id in offer_ids:
+        row = latest_by_offer.get(offer_id) or {}
+        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        offer_name = _safe_str(meta.get("offer_name") or meta.get("offer_title") or meta.get("title")).strip() or "Offre en cours"
+        image_url = _safe_str(meta.get("image_url") or meta.get("offer_image") or meta.get("offer_image_url")).strip()
+
+        template = meta.get("tasks_template")
+        if not isinstance(template, list) or not template:
+            continue
+
+        completed = completed_by_offer.get(offer_id) or {"install": False, "event_ids": set(), "event_names": set()}
+        install_done = bool(completed.get("install"))
+        if not install_done and not (completed.get("event_ids") or completed.get("event_names")):
+            continue
+
+        next_task = None
+        for t in template[:40]:
+            if not isinstance(t, dict):
+                continue
+            tid = _safe_str(t.get("id")).strip()
+            label = _safe_str(t.get("label")).strip()
+            ttype = _safe_str(t.get("type")).strip().lower()
+            if not tid and not label:
+                continue
+            if ttype == "install":
+                if install_done:
+                    continue
+                next_task = {"id": tid, "label": label or "Installer l'application", "type": "install", "points": safe_int(t.get("points"), 0)}
+                break
+            if tid and tid in completed.get("event_ids", set()):
+                continue
+            if label and label.lower() in completed.get("event_names", set()):
+                continue
+            next_task = {"id": tid, "label": label, "type": ttype or "task", "points": safe_int(t.get("points"), 0)}
+            break
+
+        if not next_task or not _safe_str(next_task.get("label")).strip():
+            continue
+
+        task_points = safe_int(next_task.get("points"), 0)
+        task_label = _safe_str(next_task.get("label")).strip()
+        body = f"Ta prochaine tâche : {task_label}."
+        if task_points > 0:
+            body = f"{body} Récompense potentielle : +{task_points} points."
+
+        dedupe_key = f"offer_next_task:{user_id}:{offer_id}:{_safe_str(next_task.get('id') or task_label).strip()}"
+        payload = {
+            "kind": "info",
+            "title": offer_name,
+            "body": body,
+            "action_url": "/offres?tab=history",
+            "dedupe_key": dedupe_key,
+            "target_points": task_points if task_points > 0 else None,
+            "data": {
+                "source": "offers_next_task",
+                "target_type": "offer",
+                "offer_id": offer_id,
+                "offer_title": offer_name,
+                "offer_image_url": image_url or None,
+                "next_task_id": _safe_str(next_task.get("id")).strip() or None,
+                "next_task_label": task_label,
+                "next_task_points": task_points if task_points > 0 else None,
+                "action_url": "/offres?tab=history",
+            },
+        }
+
+        out.append(payload)
+        if len(out) >= max(1, min(int(limit), 6)):
+            break
+
+    return {"user_id": user_id, "notifications": out}
 
 
 @app.post("/admin/quiz/generate")
