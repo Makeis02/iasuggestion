@@ -2121,7 +2121,7 @@ def _compute_iframe_provider_recommendations(user_id: str, limit: int = 3) -> li
 def compute_user_mode(user_id: str) -> dict:
     from datetime import datetime, timedelta, timezone
 
-    survey_providers = {"cpx", "rapidoreach", "theoremreach", "bitlabs", "notik", "opinionuniverse"}
+    survey_providers = {"cpx", "rapidoreach", "theoremreach", "bitlabs", "opinionuniverse"}
     ignored_providers = {"page_load", "iframe", "unknown", "adgem", "wannads"}
 
     now = datetime.now(timezone.utc)
@@ -2271,7 +2271,7 @@ def recommend_survey_providers(user_id: str, limit: int = 4, mix: dict | None = 
         limit_int = 4
 
     ignored_providers = {"page_load", "iframe", "unknown"}
-    allowed_providers = {"cpx", "rapidoreach", "theoremreach", "bitlabs", "notik", "opinionuniverse"}
+    allowed_providers = {"cpx", "rapidoreach", "theoremreach", "bitlabs", "opinionuniverse"}
     fast_providers = {"cpx", "bitlabs"}
     fallback = ["cpx", "rapidoreach", "theoremreach", "bitlabs", "opinionuniverse"]
 
@@ -3374,6 +3374,33 @@ async def offer_progress_notifications(request: Request, limit: int = 3, lookbac
 @app.post("/admin/quiz/generate")
 async def admin_quiz_generate(request: Request):
     _require_admin(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    topic = body.get("topic") if isinstance(body, dict) else None
+    difficulty = body.get("difficulty") if isinstance(body, dict) else None
+
+    try:
+        llm = _generate_quiz_llm(topic=topic, difficulty=difficulty)
+    except Exception:
+        llm = None
+
+    if llm:
+        return llm
+
+    fallback = _fallback_quiz(topic=topic, difficulty=difficulty)
+    if isinstance(fallback, dict):
+        fallback["llm"] = _llm_status()
+        fallback["llm_error"] = resources.get("last_llm_error") or ""
+    return fallback
+
+
+@app.post("/internal/quiz/generate")
+async def internal_quiz_generate(request: Request):
+    _require_internal_token(request)
 
     try:
         body = await request.json()
