@@ -1194,6 +1194,122 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
     }
 
 
+def _normalize_quiz_text_py(input_text: str) -> str:
+    import unicodedata
+
+    s = _safe_str(input_text).lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join([c for c in s if unicodedata.category(c) != "Mn"])
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _strip_quiz_leading_stopwords_py(s: str) -> str:
+    stop = {
+        "le",
+        "la",
+        "les",
+        "un",
+        "une",
+        "des",
+        "du",
+        "de",
+        "d",
+        "l",
+        "the",
+        "a",
+        "an",
+    }
+    parts = [p for p in _safe_str(s).split(" ") if p]
+    while parts and parts[0] in stop:
+        parts.pop(0)
+    return " ".join(parts).strip()
+
+
+def _norm_quiz_answer_py(s: str) -> str:
+    return _strip_quiz_leading_stopwords_py(_normalize_quiz_text_py(s))
+
+
+def _acronym_for_phrase(words: list[str]) -> str:
+    toks = [w for w in words if w]
+    if not toks:
+        return ""
+    return "".join([w[0] for w in toks if w and w[0].isalnum()])[:6].lower()
+
+
+def _levenshtein_within_py(a: str, b: str, max_dist: int) -> bool:
+    if max_dist <= 0:
+        return a == b
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > max_dist:
+        return False
+    if not a:
+        return len(b) <= max_dist
+    if not b:
+        return len(a) <= max_dist
+
+    if len(a) < len(b):
+        a, b = b, a
+    n = len(a)
+    m = len(b)
+
+    v0 = list(range(m + 1))
+    v1 = [0] * (m + 1)
+
+    for i in range(n):
+        v1[0] = i + 1
+        row_min = v1[0]
+        ca = a[i]
+        for j in range(m):
+            cost = 0 if ca == b[j] else 1
+            deletion = v0[j + 1] + 1
+            insertion = v1[j] + 1
+            substitution = v0[j] + cost
+            val = deletion if deletion < insertion else insertion
+            if substitution < val:
+                val = substitution
+            v1[j + 1] = val
+            if val < row_min:
+                row_min = val
+        if row_min > max_dist:
+            return False
+        v0, v1 = v1, v0
+    return v0[m] <= max_dist
+
+
+def _answers_match_base(base_norm: str, candidate_norm: str) -> bool:
+    if not base_norm or not candidate_norm:
+        return False
+    if base_norm == candidate_norm:
+        return True
+
+    base_compact = base_norm.replace(" ", "")
+    cand_compact = candidate_norm.replace(" ", "")
+    if base_compact and cand_compact and (base_compact in cand_compact or cand_compact in base_compact):
+        return True
+
+    base_tokens = [t for t in base_norm.split(" ") if t]
+    cand_tokens = [t for t in candidate_norm.split(" ") if t]
+    if set(base_tokens).intersection(set(cand_tokens)):
+        return True
+
+    short = base_norm if len(base_compact) <= len(cand_compact) else candidate_norm
+    long = candidate_norm if short == base_norm else base_norm
+    short_compact = short.replace(" ", "")
+    long_tokens = [t for t in long.split(" ") if t]
+    if 1 <= len(short_compact) <= 5 and len(long_tokens) >= 2:
+        if _acronym_for_phrase(long_tokens) == short_compact:
+            return True
+
+    max_dist = 2 if min(len(base_norm), len(candidate_norm)) <= 12 else 3
+    if _levenshtein_within_py(base_norm, candidate_norm, max_dist):
+        return True
+
+    return False
+
+
 def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
@@ -1209,6 +1325,7 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
 
     sys_prompt = (
         "Tu génères une question de quiz de culture générale en français. "
+        "Tu dois être FACTUEL et fiable. "
         "Réponds UNIQUEMENT en JSON valide, sans texte autour."
     )
     recent = resources.setdefault("recent_quiz_questions", [])
@@ -1225,16 +1342,19 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
     question = ""
     answers_raw = None
     points_raw = None
-    for _ in range(3):
+    for _ in range(5):
         avoid_block = f"\nNe répète pas ces questions:\n{last_questions_txt}\n" if last_questions_txt else "\n"
         user_prompt = (
-            "Génère une question (une seule) et les réponses acceptées. "
+            "Génère une question (une seule) et les réponses acceptées (uniquement des variantes correctes). "
             "Contraintes:\n"
             f"- topic: {topic_s}\n"
             f"- difficulté: {diff_s}\n"
             f"- {rules}\n"
             "- la question doit être claire et courte\n"
-            "- réponses acceptées: 1 à 4 variantes (minuscules, sans ponctuation)\n"
+            "- ne génère PAS de QCM: pas de mauvaises réponses, pas de distracteurs\n"
+            "- answers: 1 à 4 variantes qui désignent toutes la MÊME réponse (synonymes, variantes orthographiques)\n"
+            "- la 1ère valeur de answers doit être la réponse canonique la plus simple\n"
+            "- answers: minuscules, sans ponctuation\n"
             f"- points: entier EXACT ({target_points})\n"
             f"{avoid_block}\n"
             "Format JSON attendu:\n"
@@ -1276,6 +1396,29 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
         s = re.sub(r"\s+", " ", s)
         if s:
             answers.append(s)
+
+    uniq: list[str] = []
+    seen_norm: set[str] = set()
+    for a in answers:
+        n = _norm_quiz_answer_py(a)
+        if not n:
+            continue
+        if n in seen_norm:
+            continue
+        seen_norm.add(n)
+        uniq.append(a)
+    answers = uniq[:4]
+
+    if not answers:
+        return None
+
+    base_norm = _norm_quiz_answer_py(answers[0])
+    filtered: list[str] = []
+    for a in answers:
+        n = _norm_quiz_answer_py(a)
+        if _answers_match_base(base_norm, n):
+            filtered.append(a)
+    answers = filtered[:4]
     if not answers:
         return None
 
@@ -3374,33 +3517,6 @@ async def offer_progress_notifications(request: Request, limit: int = 3, lookbac
 @app.post("/admin/quiz/generate")
 async def admin_quiz_generate(request: Request):
     _require_admin(request)
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    topic = body.get("topic") if isinstance(body, dict) else None
-    difficulty = body.get("difficulty") if isinstance(body, dict) else None
-
-    try:
-        llm = _generate_quiz_llm(topic=topic, difficulty=difficulty)
-    except Exception:
-        llm = None
-
-    if llm:
-        return llm
-
-    fallback = _fallback_quiz(topic=topic, difficulty=difficulty)
-    if isinstance(fallback, dict):
-        fallback["llm"] = _llm_status()
-        fallback["llm_error"] = resources.get("last_llm_error") or ""
-    return fallback
-
-
-@app.post("/internal/quiz/generate")
-async def internal_quiz_generate(request: Request):
-    _require_internal_token(request)
 
     try:
         body = await request.json()
