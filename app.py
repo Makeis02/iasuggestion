@@ -1310,6 +1310,33 @@ def _answers_match_base(base_norm: str, candidate_norm: str) -> bool:
     return False
 
 
+def _is_multi_answer_question_py(question: str) -> bool:
+    q = _safe_str(question).strip().lower()
+    if not q:
+        return False
+    q = re.sub(r"\s+", " ", q)
+
+    has_count = bool(re.search(r"\b(2|3|4|5|6|deux|trois|quatre|cinq|six)\b", q))
+    if not has_count:
+        return False
+
+    triggers = [
+        r"\bquels\b",
+        r"\bquelles\b",
+        r"\bcite\b",
+        r"\bcitez\b",
+        r"\bdonne\b",
+        r"\bdonnez\b",
+        r"\bnomme\b",
+        r"\bnommez\b",
+        r"\bliste\b",
+        r"\blistez\b",
+        r"\bprincipaux\b",
+        r"\bprincipales\b",
+    ]
+    return any(re.search(p, q) for p in triggers)
+
+
 def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
@@ -1351,6 +1378,7 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
             f"- difficulté: {diff_s}\n"
             f"- {rules}\n"
             "- la question doit être claire et courte\n"
+            "- la question doit avoir UNE seule réponse (pas de listes / pas de \"citez 3\" / pas de multi-réponses)\n"
             "- ne génère PAS de QCM: pas de mauvaises réponses, pas de distracteurs\n"
             "- answers: 1 à 4 variantes qui désignent toutes la MÊME réponse (synonymes, variantes orthographiques)\n"
             "- la 1ère valeur de answers doit être la réponse canonique la plus simple\n"
@@ -1377,6 +1405,8 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
         answers_raw = obj.get("answers")
         points_raw = obj.get("points")
         if not question:
+            continue
+        if _is_multi_answer_question_py(question):
             continue
         if question in recent_set:
             continue
@@ -4663,29 +4693,3 @@ async def support_chat(request: Request):
             "source": "error"
         }
 
-
-@app.post("/internal/quiz/generate")
-async def internal_quiz_generate(request: Request):
-    _require_internal_token(request)
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    topic = body.get("topic") if isinstance(body, dict) else None
-    difficulty = body.get("difficulty") if isinstance(body, dict) else None
-
-    try:
-        llm = _generate_quiz_llm(topic=topic, difficulty=difficulty)
-    except Exception:
-        llm = None
-
-    if llm:
-        return llm
-
-    fallback = _fallback_quiz(topic=topic, difficulty=difficulty)
-    if isinstance(fallback, dict):
-        fallback["llm"] = _llm_status()
-        fallback["llm_error"] = resources.get("last_llm_error") or ""
-    return fallback
