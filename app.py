@@ -1337,6 +1337,30 @@ def _is_multi_answer_question_py(question: str) -> bool:
     return any(re.search(p, q) for p in triggers)
 
 
+def _is_definition_question_py(question: str) -> bool:
+    q = _safe_str(question).strip().lower()
+    if not q:
+        return False
+    q = re.sub(r"\s+", " ", q)
+    triggers = [
+        "qu'est ce",
+        "qu’est ce",
+        "c est quoi",
+        "c’est quoi",
+        "que signifie",
+        "signifie",
+        "definis",
+        "définis",
+        "definition",
+        "définition",
+        "se caracterise",
+        "se caractérise",
+        "designe",
+        "désigne",
+    ]
+    return any(t in q for t in triggers)
+
+
 def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
@@ -1369,6 +1393,7 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
     question = ""
     answers_raw = None
     points_raw = None
+    answers: list[str] = []
     for _ in range(5):
         avoid_block = f"\nNe répète pas ces questions:\n{last_questions_txt}\n" if last_questions_txt else "\n"
         user_prompt = (
@@ -1406,50 +1431,57 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
         points_raw = obj.get("points")
         if not question:
             continue
+        if _is_definition_question_py(question):
+            continue
         if _is_multi_answer_question_py(question):
             continue
         if question in recent_set:
             continue
-        break
-    if not question:
-        return None
 
-    answers: list[str] = []
-    if isinstance(answers_raw, list):
-        for a in answers_raw[:4]:
-            s = _safe_str(a).strip().lower()
+        tmp_answers: list[str] = []
+        if isinstance(answers_raw, list):
+            for a in answers_raw[:4]:
+                s = _safe_str(a).strip().lower()
+                s = re.sub(r"\s+", " ", s)
+                if s:
+                    tmp_answers.append(s)
+        elif isinstance(answers_raw, str):
+            s = _safe_str(answers_raw).strip().lower()
             s = re.sub(r"\s+", " ", s)
             if s:
-                answers.append(s)
-    elif isinstance(answers_raw, str):
-        s = _safe_str(answers_raw).strip().lower()
-        s = re.sub(r"\s+", " ", s)
-        if s:
-            answers.append(s)
+                tmp_answers.append(s)
 
-    uniq: list[str] = []
-    seen_norm: set[str] = set()
-    for a in answers:
-        n = _norm_quiz_answer_py(a)
-        if not n:
+        uniq: list[str] = []
+        seen_norm: set[str] = set()
+        for a in tmp_answers:
+            n = _norm_quiz_answer_py(a)
+            if not n:
+                continue
+            if n in seen_norm:
+                continue
+            seen_norm.add(n)
+            uniq.append(a)
+        tmp_answers = uniq[:4]
+        if not tmp_answers:
             continue
-        if n in seen_norm:
+
+        qn = _norm_quiz_answer_py(question)
+        base_norm = _norm_quiz_answer_py(tmp_answers[0])
+        if base_norm and len(base_norm.replace(" ", "")) >= 4 and base_norm in qn:
             continue
-        seen_norm.add(n)
-        uniq.append(a)
-    answers = uniq[:4]
 
-    if not answers:
-        return None
+        filtered: list[str] = []
+        for a in tmp_answers:
+            n = _norm_quiz_answer_py(a)
+            if _answers_match_base(base_norm, n):
+                filtered.append(a)
+        tmp_answers = filtered[:4]
+        if not tmp_answers:
+            continue
 
-    base_norm = _norm_quiz_answer_py(answers[0])
-    filtered: list[str] = []
-    for a in answers:
-        n = _norm_quiz_answer_py(a)
-        if _answers_match_base(base_norm, n):
-            filtered.append(a)
-    answers = filtered[:4]
-    if not answers:
+        answers = tmp_answers
+        break
+    if not question or not answers:
         return None
 
     try:
@@ -4692,4 +4724,3 @@ async def support_chat(request: Request):
             "response": f"Une erreur technique est survenue: {str(e)}",
             "source": "error"
         }
-
