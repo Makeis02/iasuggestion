@@ -1361,6 +1361,23 @@ def _is_definition_question_py(question: str) -> bool:
     return any(t in q for t in triggers)
 
 
+def _is_ambiguous_quiz_question_py(question: str) -> bool:
+    q = _safe_str(question).strip().lower()
+    if not q:
+        return False
+    q = re.sub(r"\s+", " ", q)
+    if "francophonie" in q:
+        return True
+    return False
+
+
+def _clean_quiz_answer_py(answer: str) -> str:
+    s = _safe_str(answer).strip().lower()
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
@@ -1435,19 +1452,19 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
             continue
         if _is_multi_answer_question_py(question):
             continue
+        if _is_ambiguous_quiz_question_py(question):
+            continue
         if question in recent_set:
             continue
 
         tmp_answers: list[str] = []
         if isinstance(answers_raw, list):
             for a in answers_raw[:4]:
-                s = _safe_str(a).strip().lower()
-                s = re.sub(r"\s+", " ", s)
+                s = _clean_quiz_answer_py(a)
                 if s:
                     tmp_answers.append(s)
         elif isinstance(answers_raw, str):
-            s = _safe_str(answers_raw).strip().lower()
-            s = re.sub(r"\s+", " ", s)
+            s = _clean_quiz_answer_py(answers_raw)
             if s:
                 tmp_answers.append(s)
 
@@ -1476,6 +1493,21 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
             if _answers_match_base(base_norm, n):
                 filtered.append(a)
         tmp_answers = filtered[:4]
+        if not tmp_answers:
+            continue
+
+        short: list[str] = []
+        for a in tmp_answers:
+            tokens = [t for t in _safe_str(a).split(" ") if t]
+            if len(tokens) > 3:
+                continue
+            if len(_safe_str(a).replace(" ", "")) < 2:
+                continue
+            short.append(a)
+        if not short:
+            continue
+        short.sort(key=lambda s: (len([t for t in s.split(" ") if t]), len(s)))
+        tmp_answers = short[:4]
         if not tmp_answers:
             continue
 
