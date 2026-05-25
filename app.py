@@ -1290,11 +1290,6 @@ def _answers_match_base(base_norm: str, candidate_norm: str) -> bool:
     if base_compact and cand_compact and (base_compact in cand_compact or cand_compact in base_compact):
         return True
 
-    base_tokens = [t for t in base_norm.split(" ") if t]
-    cand_tokens = [t for t in candidate_norm.split(" ") if t]
-    if set(base_tokens).intersection(set(cand_tokens)):
-        return True
-
     short = base_norm if len(base_compact) <= len(cand_compact) else candidate_norm
     long = candidate_norm if short == base_norm else base_norm
     short_compact = short.replace(" ", "")
