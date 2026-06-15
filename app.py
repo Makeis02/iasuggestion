@@ -1194,185 +1194,6 @@ def _fallback_quiz(topic: str | None, difficulty: str | None) -> dict:
     }
 
 
-def _normalize_quiz_text_py(input_text: str) -> str:
-    import unicodedata
-
-    s = _safe_str(input_text).lower()
-    s = unicodedata.normalize("NFD", s)
-    s = "".join([c for c in s if unicodedata.category(c) != "Mn"])
-    s = re.sub(r"[^a-z0-9\s]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _strip_quiz_leading_stopwords_py(s: str) -> str:
-    stop = {
-        "le",
-        "la",
-        "les",
-        "un",
-        "une",
-        "des",
-        "du",
-        "de",
-        "d",
-        "l",
-        "the",
-        "a",
-        "an",
-    }
-    parts = [p for p in _safe_str(s).split(" ") if p]
-    while parts and parts[0] in stop:
-        parts.pop(0)
-    return " ".join(parts).strip()
-
-
-def _norm_quiz_answer_py(s: str) -> str:
-    return _strip_quiz_leading_stopwords_py(_normalize_quiz_text_py(s))
-
-
-def _acronym_for_phrase(words: list[str]) -> str:
-    toks = [w for w in words if w]
-    if not toks:
-        return ""
-    return "".join([w[0] for w in toks if w and w[0].isalnum()])[:6].lower()
-
-
-def _levenshtein_within_py(a: str, b: str, max_dist: int) -> bool:
-    if max_dist <= 0:
-        return a == b
-    if a == b:
-        return True
-    if abs(len(a) - len(b)) > max_dist:
-        return False
-    if not a:
-        return len(b) <= max_dist
-    if not b:
-        return len(a) <= max_dist
-
-    if len(a) < len(b):
-        a, b = b, a
-    n = len(a)
-    m = len(b)
-
-    v0 = list(range(m + 1))
-    v1 = [0] * (m + 1)
-
-    for i in range(n):
-        v1[0] = i + 1
-        row_min = v1[0]
-        ca = a[i]
-        for j in range(m):
-            cost = 0 if ca == b[j] else 1
-            deletion = v0[j + 1] + 1
-            insertion = v1[j] + 1
-            substitution = v0[j] + cost
-            val = deletion if deletion < insertion else insertion
-            if substitution < val:
-                val = substitution
-            v1[j + 1] = val
-            if val < row_min:
-                row_min = val
-        if row_min > max_dist:
-            return False
-        v0, v1 = v1, v0
-    return v0[m] <= max_dist
-
-
-def _answers_match_base(base_norm: str, candidate_norm: str) -> bool:
-    if not base_norm or not candidate_norm:
-        return False
-    if base_norm == candidate_norm:
-        return True
-
-    base_compact = base_norm.replace(" ", "")
-    cand_compact = candidate_norm.replace(" ", "")
-    if base_compact and cand_compact and (base_compact in cand_compact or cand_compact in base_compact):
-        return True
-
-    short = base_norm if len(base_compact) <= len(cand_compact) else candidate_norm
-    long = candidate_norm if short == base_norm else base_norm
-    short_compact = short.replace(" ", "")
-    long_tokens = [t for t in long.split(" ") if t]
-    if 1 <= len(short_compact) <= 5 and len(long_tokens) >= 2:
-        if _acronym_for_phrase(long_tokens) == short_compact:
-            return True
-
-    max_dist = 2 if min(len(base_norm), len(candidate_norm)) <= 12 else 3
-    if _levenshtein_within_py(base_norm, candidate_norm, max_dist):
-        return True
-
-    return False
-
-
-def _is_multi_answer_question_py(question: str) -> bool:
-    q = _safe_str(question).strip().lower()
-    if not q:
-        return False
-    q = re.sub(r"\s+", " ", q)
-
-    has_count = bool(re.search(r"\b(2|3|4|5|6|deux|trois|quatre|cinq|six)\b", q))
-    if not has_count:
-        return False
-
-    triggers = [
-        r"\bquels\b",
-        r"\bquelles\b",
-        r"\bcite\b",
-        r"\bcitez\b",
-        r"\bdonne\b",
-        r"\bdonnez\b",
-        r"\bnomme\b",
-        r"\bnommez\b",
-        r"\bliste\b",
-        r"\blistez\b",
-        r"\bprincipaux\b",
-        r"\bprincipales\b",
-    ]
-    return any(re.search(p, q) for p in triggers)
-
-
-def _is_definition_question_py(question: str) -> bool:
-    q = _safe_str(question).strip().lower()
-    if not q:
-        return False
-    q = re.sub(r"\s+", " ", q)
-    triggers = [
-        "qu'est ce",
-        "qu’est ce",
-        "c est quoi",
-        "c’est quoi",
-        "que signifie",
-        "signifie",
-        "definis",
-        "définis",
-        "definition",
-        "définition",
-        "se caracterise",
-        "se caractérise",
-        "designe",
-        "désigne",
-    ]
-    return any(t in q for t in triggers)
-
-
-def _is_ambiguous_quiz_question_py(question: str) -> bool:
-    q = _safe_str(question).strip().lower()
-    if not q:
-        return False
-    q = re.sub(r"\s+", " ", q)
-    if "francophonie" in q:
-        return True
-    return False
-
-
-def _clean_quiz_answer_py(answer: str) -> str:
-    s = _safe_str(answer).strip().lower()
-    s = re.sub(r"[^a-z0-9\s]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
 def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None:
     topic_s = _safe_str(topic).strip() or "culture_generale"
     diff_s = _safe_str(difficulty).strip().lower() or "medium"
@@ -1388,7 +1209,6 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
 
     sys_prompt = (
         "Tu génères une question de quiz de culture générale en français. "
-        "Tu dois être FACTUEL et fiable. "
         "Réponds UNIQUEMENT en JSON valide, sans texte autour."
     )
     recent = resources.setdefault("recent_quiz_questions", [])
@@ -1405,21 +1225,16 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
     question = ""
     answers_raw = None
     points_raw = None
-    answers: list[str] = []
-    for _ in range(5):
+    for _ in range(3):
         avoid_block = f"\nNe répète pas ces questions:\n{last_questions_txt}\n" if last_questions_txt else "\n"
         user_prompt = (
-            "Génère une question (une seule) et les réponses acceptées (uniquement des variantes correctes). "
+            "Génère une question (une seule) et les réponses acceptées. "
             "Contraintes:\n"
             f"- topic: {topic_s}\n"
             f"- difficulté: {diff_s}\n"
             f"- {rules}\n"
             "- la question doit être claire et courte\n"
-            "- la question doit avoir UNE seule réponse (pas de listes / pas de \"citez 3\" / pas de multi-réponses)\n"
-            "- ne génère PAS de QCM: pas de mauvaises réponses, pas de distracteurs\n"
-            "- answers: 1 à 4 variantes qui désignent toutes la MÊME réponse (synonymes, variantes orthographiques)\n"
-            "- la 1ère valeur de answers doit être la réponse canonique la plus simple\n"
-            "- answers: minuscules, sans ponctuation\n"
+            "- réponses acceptées: 1 à 4 variantes (minuscules, sans ponctuation)\n"
             f"- points: entier EXACT ({target_points})\n"
             f"{avoid_block}\n"
             "Format JSON attendu:\n"
@@ -1443,72 +1258,25 @@ def _generate_quiz_llm(topic: str | None, difficulty: str | None) -> dict | None
         points_raw = obj.get("points")
         if not question:
             continue
-        if _is_definition_question_py(question):
-            continue
-        if _is_multi_answer_question_py(question):
-            continue
-        if _is_ambiguous_quiz_question_py(question):
-            continue
         if question in recent_set:
             continue
-
-        tmp_answers: list[str] = []
-        if isinstance(answers_raw, list):
-            for a in answers_raw[:4]:
-                s = _clean_quiz_answer_py(a)
-                if s:
-                    tmp_answers.append(s)
-        elif isinstance(answers_raw, str):
-            s = _clean_quiz_answer_py(answers_raw)
-            if s:
-                tmp_answers.append(s)
-
-        uniq: list[str] = []
-        seen_norm: set[str] = set()
-        for a in tmp_answers:
-            n = _norm_quiz_answer_py(a)
-            if not n:
-                continue
-            if n in seen_norm:
-                continue
-            seen_norm.add(n)
-            uniq.append(a)
-        tmp_answers = uniq[:4]
-        if not tmp_answers:
-            continue
-
-        qn = _norm_quiz_answer_py(question)
-        base_norm = _norm_quiz_answer_py(tmp_answers[0])
-        if base_norm and len(base_norm.replace(" ", "")) >= 4 and base_norm in qn:
-            continue
-
-        filtered: list[str] = []
-        for a in tmp_answers:
-            n = _norm_quiz_answer_py(a)
-            if _answers_match_base(base_norm, n):
-                filtered.append(a)
-        tmp_answers = filtered[:4]
-        if not tmp_answers:
-            continue
-
-        short: list[str] = []
-        for a in tmp_answers:
-            tokens = [t for t in _safe_str(a).split(" ") if t]
-            if len(tokens) > 3:
-                continue
-            if len(_safe_str(a).replace(" ", "")) < 2:
-                continue
-            short.append(a)
-        if not short:
-            continue
-        short.sort(key=lambda s: (len([t for t in s.split(" ") if t]), len(s)))
-        tmp_answers = short[:4]
-        if not tmp_answers:
-            continue
-
-        answers = tmp_answers
         break
-    if not question or not answers:
+    if not question:
+        return None
+
+    answers: list[str] = []
+    if isinstance(answers_raw, list):
+        for a in answers_raw[:4]:
+            s = _safe_str(a).strip().lower()
+            s = re.sub(r"\s+", " ", s)
+            if s:
+                answers.append(s)
+    elif isinstance(answers_raw, str):
+        s = _safe_str(answers_raw).strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        if s:
+            answers.append(s)
+    if not answers:
         return None
 
     try:
@@ -1646,19 +1414,29 @@ def _fallback_notification_message(payload: dict) -> dict:
     if focus and focus.get("kind") == "survey_provider":
         p = _safe_str(focus.get("provider")).strip().lower()
         if p in ACTIVE_SURVEY_PROVIDERS:
+            is_best = p in {"opinionuniverse"}
             return {
                 "kind": "info",
                 "title": "Nouveau sondage disponible",
-                "body": f"Réponds au mur de sondages {_provider_label(p)} et gagne des points.",
+                "body": (
+                    f"Les meilleurs sondages sont sur {_provider_label(p)}. Va voir maintenant et gagne des points."
+                    if is_best
+                    else f"Réponds au mur de sondages {_provider_label(p)} et gagne des points."
+                ),
             }
 
     if focus and focus.get("kind") == "iframe_provider":
         p = _safe_str(focus.get("provider")).strip().lower()
         if p:
+            is_best = p in {"timewall"}
             return {
                 "kind": "info",
                 "title": "Nouvelles offres disponibles",
-                "body": f"Découvre les offres via {_provider_label(p)} et gagne des points.",
+                "body": (
+                    f"Les meilleurs sondages sont sur {_provider_label(p)}. Va voir maintenant et gagne des points."
+                    if is_best
+                    else f"Découvre les offres via {_provider_label(p)} et gagne des points."
+                ),
             }
 
     target = payload.get("target")
@@ -1948,7 +1726,7 @@ def _normalize_offerwall_provider(value: str | None) -> str | None:
     return None
 
 
-def _compute_offerwall_provider_recommendations(user_id: str, limit: int = 3) -> list[dict]:
+def _compute_offerwall_provider_recommendations(user_id: str, limit: int = 3, device: str | None = None) -> list[dict]:
     from datetime import datetime, timedelta, timezone
 
     try:
@@ -1960,6 +1738,12 @@ def _compute_offerwall_provider_recommendations(user_id: str, limit: int = 3) ->
     now = datetime.now(timezone.utc)
     since_impressions = _to_iso(now - timedelta(days=30))
     since_history = _to_iso(now - timedelta(days=60))
+    effective_device = _normalize_device(device)
+    desired_platform = (
+        "Android"
+        if effective_device == "android"
+        else ("iOS" if effective_device == "ios" else ("Desktop" if effective_device == "desktop" else None))
+    )
 
     behavior_counts: dict[str, int] = {}
     try:
@@ -2033,6 +1817,51 @@ def _compute_offerwall_provider_recommendations(user_id: str, limit: int = 3) ->
 
     max_completed = max(completed_counts.values()) if completed_counts else 0
 
+    device_counts: dict[str, int] = {}
+    if desired_platform:
+        try:
+            tracking_rows = _supabase_get_first_success(
+                "offer_tracking",
+                variants=[
+                    {
+                        "select": "metadata,created_at",
+                        "user_id": f"eq.{user_id}",
+                        "action_type": "eq.click",
+                        "created_at": f"gte.{since_history}",
+                        "order": "created_at.desc",
+                        "limit": "1500",
+                    },
+                    {
+                        "select": "metadata",
+                        "user_id": f"eq.{user_id}",
+                        "action_type": "eq.click",
+                        "created_at": f"gte.{since_history}",
+                        "limit": "1500",
+                    },
+                    {"select": "metadata", "user_id": f"eq.{user_id}", "action_type": "eq.click", "limit": "1500"},
+                ],
+                timeout_s=22,
+            )
+            for r in tracking_rows:
+                if not isinstance(r, dict):
+                    continue
+                meta = r.get("metadata")
+                if not isinstance(meta, dict):
+                    continue
+                p = _normalize_offerwall_provider(meta.get("provider"))
+                if not p or p not in candidates:
+                    continue
+                plats_raw = meta.get("platforms")
+                plats = []
+                if isinstance(plats_raw, list):
+                    plats = [str(x) for x in plats_raw if x is not None]
+                if desired_platform in plats:
+                    device_counts[p] = device_counts.get(p, 0) + 1
+        except Exception:
+            device_counts = {}
+
+    max_device = max(device_counts.values()) if device_counts else 0
+
     has_any_signal = bool(behavior_counts) or bool(completed_counts)
     if not has_any_signal:
         return _offerwall_provider_fallback(limit_int)
@@ -2041,11 +1870,14 @@ def _compute_offerwall_provider_recommendations(user_id: str, limit: int = 3) ->
     for p in sorted(candidates):
         score_behavior = (behavior_counts.get(p, 0) / max_behavior) if max_behavior > 0 else 0.0
         score_history = (completed_counts.get(p, 0) / max_completed) if max_completed > 0 else 0.0
-        score = clamp01(0.65 * float(score_behavior) + 0.35 * float(score_history))
+        score_device = (device_counts.get(p, 0) / max_device) if max_device > 0 else 0.0
+        score = clamp01(0.6 * float(score_behavior) + 0.3 * float(score_history) + 0.1 * float(score_device))
 
         reason = "Recommandé"
         if score_history > 0:
             reason = f"Tu convertis bien sur {p}"
+        elif score_device > 0:
+            reason = f"Souvent utilisé sur {desired_platform}"
         elif score_behavior > 0.2:
             reason = f"Tu l’ouvres souvent ({p})"
 
@@ -2667,9 +2499,9 @@ def recommend_survey_providers(user_id: str, limit: int = 4, mix: dict | None = 
     return items
 
 
-def recommend_offerwall_providers(user_id: str, limit: int = 3, mix: dict | None = None) -> list[dict]:
+def recommend_offerwall_providers(user_id: str, limit: int = 3, mix: dict | None = None, device: str | None = None) -> list[dict]:
     try:
-        return _compute_offerwall_provider_recommendations(user_id=user_id, limit=limit)
+        return _compute_offerwall_provider_recommendations(user_id=user_id, limit=limit, device=device)
     except Exception:
         return _offerwall_provider_fallback(limit)
 
@@ -3127,6 +2959,13 @@ def recommend_offers_internal(
         limit_int = max(1, safe_int(limit, 6))
     except Exception:
         limit_int = 6
+    effective_country = _safe_str(country).strip().upper() or None
+    effective_device = _normalize_device(device)
+    desired_platform = (
+        "Android"
+        if effective_device == "android"
+        else ("iOS" if effective_device == "ios" else ("Desktop" if effective_device == "desktop" else None))
+    )
 
     now = datetime.now(timezone.utc)
     since_global = _to_iso(now - timedelta(days=45))
@@ -3169,13 +3008,13 @@ def recommend_offers_internal(
             "transaction_offers",
             variants=[
                 {
-                    "select": "offer_id,offer_name,points,provider,created_at,status",
+                    "select": "offer_id,offer_name,points,provider,country,created_at,status",
                     "status": "eq.1",
                     "created_at": f"gte.{since_global}",
                     "order": "created_at.desc",
                     "limit": "4000",
                 },
-                {"select": "offer_id,offer_name,points,provider,status", "status": "eq.1", "limit": "4000"},
+                {"select": "offer_id,offer_name,points,provider,country,status", "status": "eq.1", "limit": "4000"},
             ],
             timeout_s=22,
         )
@@ -3191,6 +3030,10 @@ def recommend_offers_internal(
             continue
         if oid in already_done:
             continue
+        if effective_country:
+            row_country = _safe_str(r.get("country")).strip().upper()
+            if row_country and row_country != effective_country:
+                continue
         pts = safe_int(r.get("points"), 0)
         if pts <= 0:
             continue
@@ -3251,6 +3094,98 @@ def recommend_offers_internal(
     seed_int = int(hashlib.sha256(f"{user_id}:{month_key}:offers".encode("utf-8")).hexdigest()[:12], 16)
     rng = random.Random(seed_int)
     pool = items[:60]
+
+    def _pg_in(values: list[str]) -> str:
+        cleaned: list[str] = []
+        for v in values:
+            s = _safe_str(v).strip()
+            if not s:
+                continue
+            s = s.replace('"', '""')
+            cleaned.append(f'"{s}"')
+        if not cleaned:
+            return "in.()"
+        return f"in.({','.join(cleaned)})"
+
+    def _offer_id_variants(raw: str) -> list[str]:
+        out: set[str] = set()
+        s = _safe_str(raw).strip()
+        if not s:
+            return []
+        out.add(s)
+        lower = s.lower()
+        out.add(lower)
+        prefixes = ["revlum_", "kiwiwall_", "notik_", "opinionuniverse_"]
+        prefix = next((p for p in prefixes if lower.startswith(p)), None)
+        if prefix:
+            without = s[len(prefix) :].strip()
+            if without:
+                out.add(without)
+                out.add(without.lower())
+        return list(out)
+
+    if desired_platform:
+        try:
+            candidate_ids: list[str] = []
+            for it in pool:
+                if not isinstance(it, dict):
+                    continue
+                candidate_ids.extend(_offer_id_variants(_safe_str(it.get("offer_id"))))
+            candidate_ids = list(dict.fromkeys([c for c in candidate_ids if c]))[:120]
+
+            tracking_rows = _supabase_get(
+                "offer_tracking",
+                params={
+                    "select": "offer_id,metadata,created_at",
+                    "action_type": "eq.click",
+                    "offer_id": _pg_in(candidate_ids),
+                    "order": "created_at.desc",
+                    "limit": "1200",
+                },
+                timeout_s=18,
+            )
+        except Exception:
+            tracking_rows = []
+
+        platforms_by_offer: dict[str, set[str]] = {}
+        for r in tracking_rows:
+            if not isinstance(r, dict):
+                continue
+            oid = _safe_str(r.get("offer_id")).strip()
+            if not oid:
+                continue
+            meta = r.get("metadata")
+            if not isinstance(meta, dict):
+                continue
+            plats_raw = meta.get("platforms")
+            if not isinstance(plats_raw, list):
+                continue
+            plats = {str(p) for p in plats_raw if p is not None}
+            if not plats:
+                continue
+            for v in _offer_id_variants(oid):
+                existing = platforms_by_offer.get(v)
+                platforms_by_offer[v] = (existing or set()) | plats
+
+        filtered: list[dict] = []
+        for it in pool:
+            if not isinstance(it, dict):
+                continue
+            oid = _safe_str(it.get("offer_id")).strip()
+            known_plats: set[str] | None = None
+            for v in _offer_id_variants(oid):
+                if v in platforms_by_offer:
+                    known_plats = platforms_by_offer.get(v)
+                    break
+            if known_plats is not None and len(known_plats) > 0:
+                if desired_platform not in known_plats:
+                    continue
+                it["score"] = round(float(clamp01(float(it.get("score", 0.0)) * 1.06)), 4)
+            else:
+                it["score"] = round(float(clamp01(float(it.get("score", 0.0)) * 0.97)), 4)
+            filtered.append(it)
+        pool = filtered or pool
+
     rng.shuffle(pool)
     return pool[:limit_int]
 
@@ -3393,7 +3328,7 @@ def get_personalization(
         surveys = _survey_provider_fallback(surveys_limit)
 
     try:
-        offerwalls = recommend_offerwall_providers(user_id=user_id, limit=offerwalls_limit, mix=mix)
+        offerwalls = recommend_offerwall_providers(user_id=user_id, limit=offerwalls_limit, mix=mix, device=device)
     except Exception:
         offerwalls = _offerwall_provider_fallback(offerwalls_limit)
 
@@ -3433,9 +3368,9 @@ def get_iframe_recommendations(user_id: str, limit: int = 3):
 
 
 @app.get("/offerwall-provider-recommendations/{user_id}")
-def get_offerwall_provider_recommendations(user_id: str, limit: int = 3):
+def get_offerwall_provider_recommendations(user_id: str, limit: int = 3, device: str | None = None):
     try:
-        items = _compute_offerwall_provider_recommendations(user_id=user_id, limit=limit)
+        items = _compute_offerwall_provider_recommendations(user_id=user_id, limit=limit, device=device)
     except Exception:
         items = _offerwall_provider_fallback(limit)
     return {"user_id": user_id, "items": items}
@@ -4751,3 +4686,30 @@ async def support_chat(request: Request):
             "response": f"Une erreur technique est survenue: {str(e)}",
             "source": "error"
         }
+
+
+@app.post("/internal/quiz/generate")
+async def internal_quiz_generate(request: Request):
+    _require_internal_token(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    topic = body.get("topic") if isinstance(body, dict) else None
+    difficulty = body.get("difficulty") if isinstance(body, dict) else None
+
+    try:
+        llm = _generate_quiz_llm(topic=topic, difficulty=difficulty)
+    except Exception:
+        llm = None
+
+    if llm:
+        return llm
+
+    fallback = _fallback_quiz(topic=topic, difficulty=difficulty)
+    if isinstance(fallback, dict):
+        fallback["llm"] = _llm_status()
+        fallback["llm_error"] = resources.get("last_llm_error") or ""
+    return fallback
