@@ -8,6 +8,8 @@ import random
 import re
 import uuid
 import hashlib
+from time import monotonic
+from threading import Lock
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,6 +22,73 @@ from fastapi.middleware.cors import CORSMiddleware
 BASE_DIR = Path(__file__).resolve().parent
 resources: dict = {}
 SERVICE_VERSION = "2026-02-18-quiz-llm-health-v2"
+
+
+def _personalization_cache_ttl_sec() -> int:
+    raw = os.environ.get("IA_PERSONALIZATION_CACHE_TTL_SEC") or ""
+    try:
+        n = int(str(raw).strip())
+    except Exception:
+        n = 1800
+    if n < 600:
+        n = 600
+    if n > 3600:
+        n = 3600
+    return n
+
+
+def _personalization_cache_max_entries() -> int:
+    raw = os.environ.get("IA_PERSONALIZATION_CACHE_MAX_ENTRIES") or ""
+    try:
+        n = int(str(raw).strip())
+    except Exception:
+        n = 2000
+    if n < 200:
+        n = 200
+    if n > 20000:
+        n = 20000
+    return n
+
+
+def _personalization_cache_key(user_id: str, limit_int: int, country: str | None, device: str | None) -> str:
+    c = str(country or "").strip().upper()
+    d = str(device or "").strip().lower()
+    return f"{user_id}:{int(limit_int)}:{c}:{d}"
+
+
+def _personalization_cache_get(key: str) -> dict | None:
+    ttl = _personalization_cache_ttl_sec()
+    lock = resources.setdefault("personalization_cache_lock", Lock())
+    cache = resources.setdefault("personalization_cache", {})
+    now = monotonic()
+    with lock:
+        entry = cache.get(key)
+        if not entry:
+            return None
+        ts = float(entry.get("ts") or 0.0)
+        if (now - ts) > float(ttl):
+            cache.pop(key, None)
+            return None
+        val = entry.get("val")
+        if not isinstance(val, dict):
+            cache.pop(key, None)
+            return None
+        return json.loads(json.dumps(val))
+
+
+def _personalization_cache_set(key: str, value: dict) -> None:
+    lock = resources.setdefault("personalization_cache_lock", Lock())
+    cache = resources.setdefault("personalization_cache", {})
+    now = monotonic()
+    with lock:
+        cache[key] = {"ts": now, "val": json.loads(json.dumps(value))}
+        max_entries = _personalization_cache_max_entries()
+        if len(cache) > max_entries:
+            items = list(cache.items())
+            items.sort(key=lambda kv: float((kv[1] or {}).get("ts") or 0.0))
+            drop = max(1, int(max_entries * 0.1))
+            for k, _ in items[:drop]:
+                cache.pop(k, None)
 
 
 
@@ -3280,6 +3349,11 @@ def get_personalization(
     except Exception:
         limit_int = 10
 
+    cache_key = _personalization_cache_key(user_id=user_id, limit_int=limit_int, country=country, device=device)
+    cached = _personalization_cache_get(cache_key)
+    if cached:
+        return cached
+
     offers_weight = float(mix.get("offers_weight", 0.5))
     surveys_weight = float(mix.get("surveys_weight", 0.5))
 
@@ -3337,7 +3411,7 @@ def get_personalization(
     except Exception:
         iframes = _iframe_provider_fallback(iframes_limit)
 
-    return {
+    out = {
         "user_id": user_id,
         "mix": mix,
         "providers": {
@@ -3347,6 +3421,8 @@ def get_personalization(
         },
         "offers": offers,
     }
+    _personalization_cache_set(cache_key, out)
+    return out
 
 
 @app.get("/survey-recommendations/{user_id}")
