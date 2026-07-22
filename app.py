@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
 resources: dict = {}
-SERVICE_VERSION = "2026-02-18-quiz-llm-health-v2"
+SERVICE_VERSION = "2026-07-22-secure-personalization-curated-live-v1"
 
 
 def _personalization_cache_ttl_sec() -> int:
@@ -2659,44 +2659,138 @@ def _require_user(request: Request) -> dict:
     return user
 
 
-def _require_admin(request: Request) -> str:
-    token = _bearer_token(request)
-    supabase_url = os.environ.get("SUPABASE_URL")
-    if not supabase_url:
-        raise HTTPException(status_code=500, detail="SUPABASE_URL manquant côté serveur")
-
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
-    if not key:
-        raise HTTPException(
-            status_code=500,
-            detail="SUPABASE_SERVICE_ROLE_KEY ou SUPABASE_ANON_KEY manquant côté serveur",
-        )
-
-    auth_resp = requests.get(
-        f"{supabase_url.rstrip('/')}/auth/v1/user",
-        headers={"apikey": key, "Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    if auth_resp.status_code != 200:
-        raise HTTPException(status_code=401, detail="Session invalide ou expirée")
-    user = auth_resp.json() or {}
-    user_id = user.get("id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Session invalide (id absent)")
+def _profile_role(user_id: str) -> str:
+    uid = _safe_str(user_id).strip()
+    if not uid:
+        return ""
 
     try:
-        rows = _supabase_get(
+        rows = _supabase_get_first_success(
             "profiles",
-            params={"select": "role", "id": f"eq.{user_id}", "limit": "1"},
+            variants=[
+                {"select": "role,is_admin", "id": f"eq.{uid}", "limit": "1"},
+                {"select": "role", "id": f"eq.{uid}", "limit": "1"},
+            ],
+            timeout_s=10,
         )
     except Exception:
-        raise HTTPException(status_code=403, detail="Accès admin refusé")
+        return ""
 
-    role = _safe_str((rows[0] if rows else {}).get("role")).strip().lower()
-    if role != "admin":
-        raise HTTPException(status_code=403, detail="Accès admin refusé")
+    profile = rows[0] if rows else {}
+    role = _safe_str(profile.get("role")).strip().lower()
+    if role:
+        return role
+    if profile.get("is_admin") is True:
+        return "admin"
+    return ""
 
+
+def _user_is_admin(user: dict) -> bool:
+    if not isinstance(user, dict):
+        return False
+
+    for metadata_key in ("app_metadata", "user_metadata"):
+        metadata = user.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        role = _safe_str(metadata.get("role")).strip().lower()
+        if role == "admin" or metadata.get("is_admin") is True:
+            return True
+
+    user_id = _safe_str(user.get("id")).strip()
+    return _profile_role(user_id) == "admin"
+
+
+def _require_admin(request: Request) -> str:
+    user = _require_user(request)
+    user_id = _safe_str(user.get("id")).strip()
+    if not user_id or not _user_is_admin(user):
+        raise HTTPException(status_code=403, detail="Accès admin refusé")
     return user_id
+
+
+def _validated_user_id(value: str, *, field_name: str = "user_id") -> str:
+    raw = _safe_str(value).strip()
+    try:
+        return str(uuid.UUID(raw))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{field_name} invalide")
+
+
+def _resolve_recommendation_user(
+    request: Request,
+    requested_user_id: str | None = None,
+) -> dict:
+    """
+    Le JWT est toujours la source d'identité.
+
+    - Un utilisateur normal ne peut demander que ses propres recommandations.
+    - Un administrateur peut préciser un autre utilisateur, pour le support ou
+      le diagnostic, sans exposer la clé service_role au navigateur.
+    - Les anciennes routes /.../{user_id} restent compatibles, mais le path ne
+      fait plus foi sans contrôle d'autorisation.
+    """
+    user = _require_user(request)
+    actor_user_id = _validated_user_id(
+        _safe_str(user.get("id")),
+        field_name="utilisateur authentifié",
+    )
+    is_admin = _user_is_admin(user)
+
+    requested = _safe_str(requested_user_id).strip()
+    if not requested or requested.lower() in {"me", "self"}:
+        target_user_id = actor_user_id
+    else:
+        target_user_id = _validated_user_id(requested, field_name="target_user_id")
+
+    if target_user_id != actor_user_id and not is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Tu ne peux demander que tes propres recommandations",
+        )
+
+    return {
+        "user": user,
+        "actor_user_id": actor_user_id,
+        "target_user_id": target_user_id,
+        "is_admin": is_admin,
+    }
+
+
+def _recommendation_rate_limit_per_minute() -> int:
+    raw = os.environ.get("IA_RECOMMENDATION_RATE_LIMIT_PER_MINUTE") or ""
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        value = 30
+    return max(5, min(value, 300))
+
+
+def _enforce_recommendation_rate_limit(actor_user_id: str, scope: str) -> None:
+    """Limiteur simple par instance, en complément du cache de personnalisation."""
+    now = monotonic()
+    window_s = 60.0
+    limit = _recommendation_rate_limit_per_minute()
+    key = f"{_safe_str(scope).strip().lower()}:{actor_user_id}"
+
+    lock = resources.setdefault("recommendation_rate_limit_lock", Lock())
+    buckets = resources.setdefault("recommendation_rate_limit", {})
+
+    with lock:
+        timestamps = [
+            float(ts)
+            for ts in (buckets.get(key) or [])
+            if now - float(ts) < window_s
+        ]
+        if len(timestamps) >= limit:
+            retry_after = max(1, int(window_s - (now - timestamps[0])))
+            raise HTTPException(
+                status_code=429,
+                detail="Trop de demandes de personnalisation",
+                headers={"Retry-After": str(retry_after)},
+            )
+        timestamps.append(now)
+        buckets[key] = timestamps
 
 
 @asynccontextmanager
@@ -3017,6 +3111,416 @@ def admin_reindex(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+RECOMMENDATION_ALGORITHM_VERSION = "giftplayz-curated-live-score-v1"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(str(raw).strip()) if raw is not None else float(default)
+    except Exception:
+        value = float(default)
+    return max(float(minimum), min(float(maximum), value))
+
+
+def _pg_in(values: list[str]) -> str:
+    cleaned: list[str] = []
+    for value in values:
+        item = _safe_str(value).strip()
+        if not item:
+            continue
+        cleaned.append(f'"{item.replace(chr(34), chr(34) * 2)}"')
+    return f"in.({','.join(cleaned)})" if cleaned else "in.()"
+
+
+def _parse_datetime(value) -> datetime | None:
+    raw = _safe_str(value).strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _canonical_offer_provider(value) -> str:
+    provider = normalize_provider(_safe_str(value)) or ""
+    aliases = {
+        "notikme": "notik",
+        "notik.me": "notik",
+        "kiwi": "kiwiwall",
+        "opinion_universe": "opinionuniverse",
+        "opinion-universe": "opinionuniverse",
+    }
+    return aliases.get(provider, provider)
+
+
+def _offer_id_aliases(provider: str, offer_id: str) -> set[str]:
+    provider_key = _canonical_offer_provider(provider)
+    raw = _safe_str(offer_id).strip()
+    if not raw:
+        return set()
+
+    try:
+        raw = requests.utils.unquote(raw)
+    except Exception:
+        pass
+
+    normalized = raw.split("?", 1)[0].split("#", 1)[0].strip().lower()
+    aliases: set[str] = {normalized}
+
+    known_prefixes = [
+        f"{provider_key}_" if provider_key else "",
+        "revlum_",
+        "kiwiwall_",
+        "notik_",
+        "opinionuniverse_",
+    ]
+    for prefix in known_prefixes:
+        if prefix and normalized.startswith(prefix):
+            without = normalized[len(prefix) :].strip()
+            if without:
+                aliases.add(without)
+
+    for candidate in list(aliases):
+        numeric_prefix = re.match(r"^(\d{3,})(?:-|_|$)", candidate)
+        if numeric_prefix:
+            aliases.add(numeric_prefix.group(1))
+
+    return {item for item in aliases if item}
+
+
+def _offer_identity_keys(provider: str, offer_id: str) -> set[str]:
+    provider_key = _canonical_offer_provider(provider)
+    if not provider_key:
+        return set()
+    return {f"{provider_key}:{alias}" for alias in _offer_id_aliases(provider_key, offer_id)}
+
+
+def _row_nested_dicts(row: dict) -> list[dict]:
+    output = [row] if isinstance(row, dict) else []
+    if not isinstance(row, dict):
+        return output
+    for key in ("metadata", "meta", "payload", "offer_payload", "raw_json", "offer"):
+        value = row.get(key)
+        if isinstance(value, dict):
+            output.append(value)
+    return output
+
+
+def _row_provider(row: dict) -> str:
+    for record in _row_nested_dicts(row):
+        for key in ("provider", "network", "source_provider"):
+            provider = _canonical_offer_provider(record.get(key))
+            if provider:
+                return provider
+    return ""
+
+
+def _row_offer_id(row: dict) -> str:
+    for record in _row_nested_dicts(row):
+        for key in ("offer_id", "offerId", "id", "campaign_id", "campaignId"):
+            value = _safe_str(record.get(key)).strip()
+            if value:
+                return value
+    return ""
+
+
+def _row_points(row: dict) -> int:
+    for record in _row_nested_dicts(row):
+        for key in ("total_points", "totalPoints", "points", "payout_points", "reward_points"):
+            points = safe_int(record.get(key), 0)
+            if points > 0:
+                return points
+    tasks = row.get("tasks") if isinstance(row, dict) else None
+    if isinstance(tasks, list):
+        total = sum(max(0, safe_int((task or {}).get("points"), 0)) for task in tasks if isinstance(task, dict))
+        if total > 0:
+            return total
+    return 0
+
+
+def _normalize_platform_name(value) -> str:
+    raw = _safe_str(value).strip().lower()
+    if raw in {"android", "google_play", "google play"}:
+        return "android"
+    if raw in {"ios", "iphone", "ipad", "apple"}:
+        return "ios"
+    if raw in {"desktop", "web", "pc", "windows", "mac", "macos"}:
+        return "desktop"
+    if raw in {"all", "any", "mobile"}:
+        return raw
+    return raw
+
+
+def _payload_platforms(payload: dict) -> set[str]:
+    platforms: set[str] = set()
+    if not isinstance(payload, dict):
+        return platforms
+    for key in ("platforms", "devices", "deviceTypes", "device_types"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            platforms.update(_normalize_platform_name(item) for item in value if _safe_str(item).strip())
+        elif isinstance(value, str):
+            platforms.update(_normalize_platform_name(item) for item in re.split(r"[,|/]", value) if item.strip())
+    for key in ("platform", "device", "device_type", "deviceType"):
+        value = _normalize_platform_name(payload.get(key))
+        if value:
+            platforms.add(value)
+    return {item for item in platforms if item}
+
+
+def _device_compatibility_score(payload: dict, desired_device: str | None) -> float:
+    desired = _normalize_device(desired_device)
+    if not desired:
+        return 0.85
+    platforms = _payload_platforms(payload)
+    if not platforms:
+        return 0.70
+    if desired in platforms or "all" in platforms or (desired in {"android", "ios"} and "mobile" in platforms):
+        return 1.0
+    return 0.0
+
+
+def _country_compatibility_score(row: dict, country: str | None) -> float:
+    desired = _safe_str(country).strip().upper()
+    if not desired:
+        return 0.85
+
+    values: set[str] = set()
+    for record in _row_nested_dicts(row):
+        for key in ("country_code", "country", "countries", "geo", "geos"):
+            value = record.get(key)
+            if isinstance(value, list):
+                values.update(_safe_str(item).strip().upper() for item in value if _safe_str(item).strip())
+            elif isinstance(value, str):
+                values.update(item.strip().upper() for item in re.split(r"[,|/]", value) if item.strip())
+    values.discard("")
+    if not values or values.intersection({"ALL", "ANY", "GLOBAL", "WW"}):
+        return 0.75
+    return 1.0 if desired in values else 0.0
+
+
+def _recency_score(value) -> float:
+    parsed = _parse_datetime(value)
+    if not parsed:
+        return 0.35
+    age_hours = max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 3600.0)
+    if age_hours <= 1:
+        return 1.0
+    if age_hours <= 6:
+        return 0.95
+    if age_hours <= 24:
+        return 0.85
+    if age_hours <= 72:
+        return 0.65
+    if age_hours <= 168:
+        return 0.40
+    return 0.15
+
+
+def _load_curated_offer_candidates(device: str | None) -> list[dict]:
+    desired = _normalize_device(device)
+    if desired:
+        platform_values = ["all", desired]
+    else:
+        platform_values = ["all", "android", "ios", "desktop"]
+
+    variants = [
+        {
+            "select": "surface,platform,position,provider,offer_id,title,enabled,offer_payload,last_synced_at",
+            "surface": "eq.offres",
+            "enabled": "eq.true",
+            "platform": _pg_in(platform_values),
+            "order": "position.asc",
+            "limit": "500",
+        },
+        {
+            "select": "platform,position,provider,offer_id,title,enabled,offer_payload,last_synced_at",
+            "enabled": "eq.true",
+            "platform": _pg_in(platform_values),
+            "order": "position.asc",
+            "limit": "500",
+        },
+    ]
+
+    try:
+        rows = _supabase_get_first_success("offres_curated_offers", variants=variants, timeout_s=18)
+    except Exception:
+        return []
+
+    normalized: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        provider = _canonical_offer_provider(row.get("provider"))
+        offer_id = _safe_str(row.get("offer_id")).strip()
+        platform = _normalize_platform_name(row.get("platform") or "all") or "all"
+        position = safe_int(row.get("position"), 999999)
+        if not provider or not offer_id:
+            continue
+        normalized.append(
+            {
+                "provider": provider,
+                "offer_id": offer_id,
+                "title": _safe_str(row.get("title")).strip(),
+                "position": position,
+                "platform": platform,
+                "offer_payload": row.get("offer_payload") if isinstance(row.get("offer_payload"), dict) else {},
+                "last_synced_at": row.get("last_synced_at"),
+            }
+        )
+
+    if desired:
+        by_position: dict[int, dict] = {}
+        for row in normalized:
+            current = by_position.get(row["position"])
+            if current is None or (current.get("platform") == "all" and row.get("platform") == desired):
+                by_position[row["position"]] = row
+        normalized = [by_position[key] for key in sorted(by_position)]
+
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for row in sorted(normalized, key=lambda item: (safe_int(item.get("position"), 999999), item.get("provider", ""))):
+        primary_key = f"{row['provider']}:{_safe_str(row['offer_id']).strip().lower()}"
+        if primary_key in seen:
+            continue
+        seen.add(primary_key)
+        unique.append(row)
+    return unique
+
+
+def _load_live_catalog_rows(user_id: str) -> list[dict]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    variants = [
+        {
+            "select": "provider,offer_id,title,description,total_points,payload,platforms,country_code,device_scope,platform_filter,last_seen_at,expires_at,sort_order",
+            "user_id": f"eq.{user_id}",
+            "expires_at": f"gt.{now_iso}",
+            "order": "last_seen_at.desc",
+            "limit": "2500",
+        },
+        {
+            "select": "provider,offer_id,title,total_points,payload,last_seen_at,expires_at",
+            "user_id": f"eq.{user_id}",
+            "expires_at": f"gt.{now_iso}",
+            "order": "last_seen_at.desc",
+            "limit": "2500",
+        },
+    ]
+    try:
+        return _supabase_get_first_success("offres_user_catalog_cache", variants=variants, timeout_s=18)
+    except Exception:
+        return []
+
+
+def _status_kind(value) -> str:
+    raw = _safe_str(value).strip().lower()
+    if raw in {"1", "success", "completed", "complete", "approved", "credited", "paid", "confirmed"}:
+        return "success"
+    if raw in {"2", "reversal", "reversed", "chargeback", "rejected", "cancelled", "canceled", "failed", "invalid"}:
+        return "reversal"
+    if raw in {"0", "pending", "started", "clicked", "click", "in_progress", "processing"}:
+        return "started"
+    return "unknown"
+
+
+def _build_candidate_maps(candidates: list[dict]) -> tuple[dict[str, str], dict[str, set[str]]]:
+    provider_alias_map: dict[str, str] = {}
+    id_alias_map: dict[str, set[str]] = {}
+    for candidate in candidates:
+        canonical = candidate["candidate_key"]
+        provider = candidate["provider"]
+        offer_id = candidate["offer_id"]
+        for identity in _offer_identity_keys(provider, offer_id):
+            provider_alias_map[identity] = canonical
+        for alias in _offer_id_aliases(provider, offer_id):
+            id_alias_map.setdefault(alias, set()).add(canonical)
+    return provider_alias_map, id_alias_map
+
+
+def _resolve_candidate_key(
+    row: dict,
+    provider_alias_map: dict[str, str],
+    id_alias_map: dict[str, set[str]],
+) -> str | None:
+    provider = _row_provider(row)
+    offer_id = _row_offer_id(row)
+    if not offer_id:
+        return None
+    if provider:
+        for identity in _offer_identity_keys(provider, offer_id):
+            canonical = provider_alias_map.get(identity)
+            if canonical:
+                return canonical
+    found: set[str] = set()
+    for alias in _offer_id_aliases(provider, offer_id):
+        found.update(id_alias_map.get(alias) or set())
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _safe_query_rows(table: str, variants: list[dict], timeout_s: int = 18) -> list[dict]:
+    try:
+        return _supabase_get_first_success(table, variants=variants, timeout_s=timeout_s)
+    except Exception:
+        return []
+
+
+def _record_recommendation_decisions(
+    user_id: str,
+    run_id: str,
+    items: list[dict],
+    country: str | None,
+    device: str | None,
+) -> None:
+    if not items:
+        return
+    created_at = datetime.now(timezone.utc).isoformat()
+    payload = []
+    for rank, item in enumerate(items, start=1):
+        payload.append(
+            {
+                "run_id": run_id,
+                "user_id": user_id,
+                "provider": item.get("provider"),
+                "offer_id": item.get("offer_id"),
+                "rank": rank,
+                "selected": True,
+                "selection_type": item.get("selection_type", "exploitation"),
+                "score": item.get("score", 0.0),
+                "reason": item.get("reason", ""),
+                "score_components": item.get("score_components") or {},
+                "penalties": item.get("penalties") or {},
+                "context": {
+                    "country": _safe_str(country).strip().upper() or None,
+                    "device": _normalize_device(device),
+                    "catalog_confirmed": bool(item.get("catalog_confirmed")),
+                    "payout_points": safe_int(item.get("payout_points"), 0),
+                },
+                "algorithm_version": RECOMMENDATION_ALGORITHM_VERSION,
+                "created_at": created_at,
+            }
+        )
+    try:
+        _supabase_post("ai_recommendation_decisions", payload, timeout_s=12)
+    except Exception:
+        # La recommandation reste disponible même si la table d'audit n'est
+        # pas encore installée ou si l'écriture échoue temporairement.
+        pass
+
+
 def recommend_offers_internal(
     user_id: str,
     limit: int,
@@ -3024,248 +3528,468 @@ def recommend_offers_internal(
     device: str | None = None,
     mix: dict | None = None,
 ) -> list[dict]:
-    try:
-        limit_int = max(1, safe_int(limit, 6))
-    except Exception:
-        limit_int = 6
-    effective_country = _safe_str(country).strip().upper() or None
-    effective_device = _normalize_device(device)
-    desired_platform = (
-        "Android"
-        if effective_device == "android"
-        else ("iOS" if effective_device == "ios" else ("Desktop" if effective_device == "desktop" else None))
-    )
+    """
+    Pipeline GiftPlayz :
+      1. sélection administrateur ;
+      2. confirmation dans le catalogue live de l'utilisateur ;
+      3. exclusion des offres terminées ;
+      4. exclusions/pénalités qualité ;
+      5. score personnel et global ;
+      6. exploitation majoritaire + découverte contrôlée ;
+      7. journalisation de la décision.
+    """
+    limit_int = max(1, min(safe_int(limit, 6), 50))
+    target_country = _safe_str(country).strip().upper() or None
+    target_device = _normalize_device(device)
 
-    now = datetime.now(timezone.utc)
-    since_global = _to_iso(now - timedelta(days=45))
-    since_user = _to_iso(now - timedelta(days=120))
-
-    try:
-        user_rows = _supabase_get_first_success(
-            "transaction_offers",
-            variants=[
-                {
-                    "select": "offer_id,created_at,status",
-                    "user_id": f"eq.{user_id}",
-                    "status": "eq.1",
-                    "created_at": f"gte.{since_user}",
-                    "order": "created_at.desc",
-                    "limit": "2000",
-                },
-                {
-                    "select": "offer_id,status",
-                    "user_id": f"eq.{user_id}",
-                    "status": "eq.1",
-                    "limit": "2000",
-                },
-            ],
-            timeout_s=18,
-        )
-    except Exception:
-        user_rows = []
-
-    already_done: set[str] = set()
-    for r in user_rows:
-        if not isinstance(r, dict):
-            continue
-        oid = _safe_str(r.get("offer_id")).strip()
-        if oid:
-            already_done.add(oid)
-
-    try:
-        global_rows = _supabase_get_first_success(
-            "transaction_offers",
-            variants=[
-                {
-                    "select": "offer_id,offer_name,points,provider,country,created_at,status",
-                    "status": "eq.1",
-                    "created_at": f"gte.{since_global}",
-                    "order": "created_at.desc",
-                    "limit": "4000",
-                },
-                {"select": "offer_id,offer_name,points,provider,country,status", "status": "eq.1", "limit": "4000"},
-            ],
-            timeout_s=22,
-        )
-    except Exception:
-        global_rows = []
-
-    agg: dict[str, dict] = {}
-    for r in global_rows:
-        if not isinstance(r, dict):
-            continue
-        oid = _safe_str(r.get("offer_id")).strip()
-        if not oid:
-            continue
-        if oid in already_done:
-            continue
-        if effective_country:
-            row_country = _safe_str(r.get("country")).strip().upper()
-            if row_country and row_country != effective_country:
-                continue
-        pts = safe_int(r.get("points"), 0)
-        if pts <= 0:
-            continue
-        name = _safe_str(r.get("offer_name")).strip()
-        provider = _safe_str(r.get("provider")).strip().lower()
-        a = agg.get(oid)
-        if not a:
-            a = {
-                "offer_id": oid,
-                "title": name or oid,
-                "provider": provider,
-                "count": 0,
-                "sum_points": 0,
-                "max_points": 0,
-            }
-            agg[oid] = a
-        a["count"] = int(a.get("count", 0)) + 1
-        a["sum_points"] = int(a.get("sum_points", 0)) + pts
-        a["max_points"] = max(int(a.get("max_points", 0)), pts)
-        if name and (a.get("title") == oid or len(_safe_str(a.get("title"))) < 6):
-            a["title"] = name
-
-    if not agg:
+    curated = _load_curated_offer_candidates(target_device)
+    if not curated:
         return []
 
-    max_count = max(int(v.get("count", 0)) for v in agg.values()) or 1
-    max_points = max(int(v.get("max_points", 0)) for v in agg.values()) or 1
+    live_rows = _load_live_catalog_rows(user_id)
+    require_live = _env_bool("IA_RECOMMENDATION_REQUIRE_LIVE_CATALOG", True)
 
-    items: list[dict] = []
-    for v in agg.values():
-        count = int(v.get("count", 0))
-        pts = int(v.get("max_points", 0)) or int(v.get("sum_points", 0) / max(1, count))
-        if pts < 200:
+    live_by_identity: dict[str, list[dict]] = {}
+    for row in live_rows:
+        if not isinstance(row, dict):
             continue
-        score_pop = float(count) / float(max_count) if max_count > 0 else 0.0
-        score_pts = float(pts) / float(max_points) if max_points > 0 else 0.0
-        score = clamp01(0.65 * score_pop + 0.35 * score_pts)
-        reason = "Populaire en ce moment"
-        if score_pts > 0.7 and score_pop > 0.35:
-            reason = "Très demandé et bon gain"
-        elif score_pts > 0.7:
-            reason = "Bon gain"
-        elif score_pop > 0.5:
-            reason = "Très demandé"
-        items.append(
+        provider = _row_provider(row)
+        offer_id = _row_offer_id(row)
+        if not provider or not offer_id:
+            continue
+        for identity in _offer_identity_keys(provider, offer_id):
+            live_by_identity.setdefault(identity, []).append(row)
+
+    candidates: list[dict] = []
+    for curated_row in curated:
+        provider = curated_row["provider"]
+        offer_id = curated_row["offer_id"]
+        matches: list[dict] = []
+        for identity in _offer_identity_keys(provider, offer_id):
+            matches.extend(live_by_identity.get(identity) or [])
+
+        # Dédupliquer les mêmes lignes retrouvées par plusieurs alias.
+        unique_matches: list[dict] = []
+        seen_match_signatures: set[str] = set()
+        for match in matches:
+            signature = f"{_row_provider(match)}:{_row_offer_id(match)}:{_safe_str(match.get('last_seen_at'))}"
+            if signature in seen_match_signatures:
+                continue
+            seen_match_signatures.add(signature)
+            unique_matches.append(match)
+
+        compatible_matches = []
+        for match in unique_matches:
+            payload = match.get("payload") if isinstance(match.get("payload"), dict) else {}
+            merged_for_context = {**payload, **match}
+            device_score = _device_compatibility_score(merged_for_context, target_device)
+            country_score = _country_compatibility_score(merged_for_context, target_country)
+            if device_score <= 0.0 or country_score <= 0.0:
+                continue
+            compatible_matches.append((match, payload, device_score, country_score))
+
+        compatible_matches.sort(
+            key=lambda item: (
+                _recency_score(item[0].get("last_seen_at")),
+                item[2],
+                item[3],
+            ),
+            reverse=True,
+        )
+
+        if compatible_matches:
+            live_row, live_payload, device_score, country_score = compatible_matches[0]
+            catalog_confirmed = True
+            payload = {**curated_row.get("offer_payload", {}), **live_payload}
+            title = _safe_str(live_row.get("title") or payload.get("title") or curated_row.get("title") or offer_id).strip()
+            payout_points = _row_points({**payload, **live_row})
+            last_seen_at = live_row.get("last_seen_at")
+        else:
+            if require_live:
+                continue
+            payload = curated_row.get("offer_payload") if isinstance(curated_row.get("offer_payload"), dict) else {}
+            device_score = _device_compatibility_score(payload, target_device)
+            country_score = _country_compatibility_score(payload, target_country)
+            if device_score <= 0.0 or country_score <= 0.0:
+                continue
+            catalog_confirmed = False
+            title = _safe_str(payload.get("title") or curated_row.get("title") or offer_id).strip()
+            payout_points = _row_points(payload)
+            last_seen_at = curated_row.get("last_synced_at")
+
+        candidate_key = f"{provider}:{_safe_str(offer_id).strip().lower()}"
+        candidates.append(
             {
-                "offer_id": _safe_str(v.get("offer_id")).strip(),
-                "title": _safe_str(v.get("title")).strip(),
-                "payout_points": pts,
-                "score": round(float(score), 4),
-                "reason": reason,
+                "candidate_key": candidate_key,
+                "provider": provider,
+                "offer_id": offer_id,
+                "title": title or offer_id,
+                "payout_points": max(0, payout_points),
+                "payload": payload,
+                "position": safe_int(curated_row.get("position"), 999999),
+                "catalog_confirmed": catalog_confirmed,
+                "device_compatibility": device_score,
+                "country_compatibility": country_score,
+                "last_seen_at": last_seen_at,
+                "last_synced_at": curated_row.get("last_synced_at"),
             }
         )
 
-    items.sort(key=lambda x: (float(x.get("score", 0.0)), safe_int(x.get("payout_points"), 0)), reverse=True)
+    if not candidates:
+        return []
 
-    month_key = now.strftime("%Y-%m")
-    seed_int = int(hashlib.sha256(f"{user_id}:{month_key}:offers".encode("utf-8")).hexdigest()[:12], 16)
-    rng = random.Random(seed_int)
-    pool = items[:60]
+    provider_alias_map, id_alias_map = _build_candidate_maps(candidates)
+    candidate_aliases: list[str] = []
+    for candidate in candidates:
+        candidate_aliases.extend(_offer_id_aliases(candidate["provider"], candidate["offer_id"]))
+    candidate_aliases = list(dict.fromkeys(item for item in candidate_aliases if item))[:500]
 
-    def _pg_in(values: list[str]) -> str:
-        cleaned: list[str] = []
-        for v in values:
-            s = _safe_str(v).strip()
-            if not s:
-                continue
-            s = s.replace('"', '""')
-            cleaned.append(f'"{s}"')
-        if not cleaned:
-            return "in.()"
-        return f"in.({','.join(cleaned)})"
+    now = datetime.now(timezone.utc)
+    global_since = _to_iso(now - timedelta(days=90))
+    user_since = _to_iso(now - timedelta(days=365))
 
-    def _offer_id_variants(raw: str) -> list[str]:
-        out: set[str] = set()
-        s = _safe_str(raw).strip()
-        if not s:
-            return []
-        out.add(s)
-        lower = s.lower()
-        out.add(lower)
-        prefixes = ["revlum_", "kiwiwall_", "notik_", "opinionuniverse_"]
-        prefix = next((p for p in prefixes if lower.startswith(p)), None)
-        if prefix:
-            without = s[len(prefix) :].strip()
-            if without:
-                out.add(without)
-                out.add(without.lower())
-        return list(out)
+    common_tx_select = "offer_id,offer_name,points,provider,country,created_at,status"
+    global_transactions = _safe_query_rows(
+        "transaction_offers",
+        variants=[
+            {
+                "select": common_tx_select,
+                "offer_id": _pg_in(candidate_aliases),
+                "created_at": f"gte.{global_since}",
+                "order": "created_at.desc",
+                "limit": "10000",
+            },
+            {
+                "select": "offer_id,points,provider,created_at,status",
+                "offer_id": _pg_in(candidate_aliases),
+                "created_at": f"gte.{global_since}",
+                "limit": "10000",
+            },
+        ],
+        timeout_s=22,
+    )
+    user_transactions = _safe_query_rows(
+        "transaction_offers",
+        variants=[
+            {
+                "select": common_tx_select,
+                "user_id": f"eq.{user_id}",
+                "offer_id": _pg_in(candidate_aliases),
+                "created_at": f"gte.{user_since}",
+                "order": "created_at.desc",
+                "limit": "5000",
+            },
+            {
+                "select": "offer_id,points,provider,created_at,status",
+                "user_id": f"eq.{user_id}",
+                "offer_id": _pg_in(candidate_aliases),
+                "limit": "5000",
+            },
+        ],
+        timeout_s=20,
+    )
 
-    if desired_platform:
-        try:
-            candidate_ids: list[str] = []
-            for it in pool:
-                if not isinstance(it, dict):
-                    continue
-                candidate_ids.extend(_offer_id_variants(_safe_str(it.get("offer_id"))))
-            candidate_ids = list(dict.fromkeys([c for c in candidate_ids if c]))[:120]
+    tracking_select = "offer_id,user_id,action_type,status,metadata,created_at"
+    global_tracking = _safe_query_rows(
+        "offer_tracking",
+        variants=[
+            {
+                "select": tracking_select,
+                "offer_id": _pg_in(candidate_aliases),
+                "action_type": "eq.click",
+                "created_at": f"gte.{global_since}",
+                "order": "created_at.desc",
+                "limit": "10000",
+            },
+            {
+                "select": "offer_id,user_id,action_type,metadata,created_at",
+                "offer_id": _pg_in(candidate_aliases),
+                "created_at": f"gte.{global_since}",
+                "limit": "10000",
+            },
+        ],
+        timeout_s=22,
+    )
+    user_tracking = _safe_query_rows(
+        "offer_tracking",
+        variants=[
+            {
+                "select": tracking_select,
+                "user_id": f"eq.{user_id}",
+                "offer_id": _pg_in(candidate_aliases),
+                "created_at": f"gte.{user_since}",
+                "order": "created_at.desc",
+                "limit": "5000",
+            },
+            {
+                "select": "offer_id,user_id,action_type,metadata,created_at",
+                "user_id": f"eq.{user_id}",
+                "offer_id": _pg_in(candidate_aliases),
+                "limit": "5000",
+            },
+        ],
+        timeout_s=20,
+    )
+    tickets = _safe_query_rows(
+        "offer_tickets",
+        variants=[
+            {
+                "select": "offer_id,user_id,status,priority,created_at",
+                "offer_id": _pg_in(candidate_aliases),
+                "created_at": f"gte.{global_since}",
+                "order": "created_at.desc",
+                "limit": "5000",
+            },
+            {
+                "select": "offer_id,user_id,created_at",
+                "offer_id": _pg_in(candidate_aliases),
+                "limit": "5000",
+            },
+        ],
+        timeout_s=18,
+    )
 
-            tracking_rows = _supabase_get(
-                "offer_tracking",
-                params={
-                    "select": "offer_id,metadata,created_at",
-                    "action_type": "eq.click",
-                    "offer_id": _pg_in(candidate_ids),
-                    "order": "created_at.desc",
-                    "limit": "1200",
-                },
-                timeout_s=18,
-            )
-        except Exception:
-            tracking_rows = []
+    metrics: dict[str, dict] = {
+        candidate["candidate_key"]: {
+            "global_clicks": 0,
+            "global_success": 0,
+            "global_reversals": 0,
+            "tickets": 0,
+            "personal_started": False,
+            "personal_completed": False,
+            "personal_ticket": False,
+        }
+        for candidate in candidates
+    }
+    provider_metrics: dict[str, dict] = {}
 
-        platforms_by_offer: dict[str, set[str]] = {}
-        for r in tracking_rows:
-            if not isinstance(r, dict):
-                continue
-            oid = _safe_str(r.get("offer_id")).strip()
-            if not oid:
-                continue
-            meta = r.get("metadata")
-            if not isinstance(meta, dict):
-                continue
-            plats_raw = meta.get("platforms")
-            if not isinstance(plats_raw, list):
-                continue
-            plats = {str(p) for p in plats_raw if p is not None}
-            if not plats:
-                continue
-            for v in _offer_id_variants(oid):
-                existing = platforms_by_offer.get(v)
-                platforms_by_offer[v] = (existing or set()) | plats
+    for row in global_transactions:
+        key = _resolve_candidate_key(row, provider_alias_map, id_alias_map)
+        if not key:
+            continue
+        kind = _status_kind(row.get("status"))
+        if kind == "success":
+            metrics[key]["global_success"] += 1
+        elif kind == "reversal":
+            metrics[key]["global_reversals"] += 1
 
-        filtered: list[dict] = []
-        for it in pool:
-            if not isinstance(it, dict):
-                continue
-            oid = _safe_str(it.get("offer_id")).strip()
-            known_plats: set[str] | None = None
-            for v in _offer_id_variants(oid):
-                if v in platforms_by_offer:
-                    known_plats = platforms_by_offer.get(v)
-                    break
-            if known_plats is not None and len(known_plats) > 0:
-                if desired_platform not in known_plats:
-                    continue
-                it["score"] = round(float(clamp01(float(it.get("score", 0.0)) * 1.06)), 4)
-            else:
-                it["score"] = round(float(clamp01(float(it.get("score", 0.0)) * 0.97)), 4)
-            filtered.append(it)
-        pool = filtered or pool
+    for row in global_tracking:
+        key = _resolve_candidate_key(row, provider_alias_map, id_alias_map)
+        if not key:
+            continue
+        action = _safe_str(row.get("action_type")).strip().lower()
+        if not action or action == "click":
+            metrics[key]["global_clicks"] += 1
 
-    rng.shuffle(pool)
-    return pool[:limit_int]
+    for row in tickets:
+        key = _resolve_candidate_key(row, provider_alias_map, id_alias_map)
+        if not key:
+            continue
+        metrics[key]["tickets"] += 1
+        if _safe_str(row.get("user_id")).strip() == user_id:
+            metrics[key]["personal_ticket"] = True
+
+    for row in user_transactions:
+        key = _resolve_candidate_key(row, provider_alias_map, id_alias_map)
+        if not key:
+            continue
+        provider = next((candidate["provider"] for candidate in candidates if candidate["candidate_key"] == key), "")
+        p_metrics = provider_metrics.setdefault(provider, {"clicks": 0, "success": 0})
+        kind = _status_kind(row.get("status"))
+        if kind == "success":
+            metrics[key]["personal_completed"] = True
+            p_metrics["success"] += 1
+        elif kind == "started":
+            metrics[key]["personal_started"] = True
+
+    for row in user_tracking:
+        key = _resolve_candidate_key(row, provider_alias_map, id_alias_map)
+        if not key:
+            continue
+        provider = next((candidate["provider"] for candidate in candidates if candidate["candidate_key"] == key), "")
+        p_metrics = provider_metrics.setdefault(provider, {"clicks": 0, "success": 0})
+        action = _safe_str(row.get("action_type")).strip().lower()
+        if not action or action == "click":
+            metrics[key]["personal_started"] = True
+            p_metrics["clicks"] += 1
+
+    max_payout_log = max((__import__("math").log1p(max(0, candidate["payout_points"])) for candidate in candidates), default=1.0) or 1.0
+    max_exposure = max(
+        (metrics[candidate["candidate_key"]]["global_clicks"] + metrics[candidate["candidate_key"]]["global_success"] for candidate in candidates),
+        default=1,
+    ) or 1
+
+    scored: list[dict] = []
+    for candidate in candidates:
+        key = candidate["candidate_key"]
+        metric = metrics[key]
+        if metric["personal_completed"]:
+            continue
+
+        clicks = int(metric["global_clicks"])
+        successes = int(metric["global_success"])
+        reversals = int(metric["global_reversals"])
+        ticket_count = int(metric["tickets"])
+
+        reversal_ratio = float(reversals) / float(max(1, successes + reversals))
+        ticket_ratio = float(ticket_count) / float(max(1, clicks, successes))
+        abandonment_ratio = float(max(0, clicks - successes)) / float(max(1, clicks))
+
+        # Exclusions qualité lorsque le volume est suffisamment significatif.
+        if reversals >= 3 and reversal_ratio >= 0.60:
+            continue
+        if ticket_count >= 5 and ticket_ratio >= 0.35:
+            continue
+
+        provider_stat = provider_metrics.get(candidate["provider"], {"clicks": 0, "success": 0})
+        p_clicks = int(provider_stat.get("clicks", 0))
+        p_success = int(provider_stat.get("success", 0))
+        if p_clicks <= 0 and p_success <= 0:
+            personal_provider_conversion = 0.50
+        else:
+            personal_provider_conversion = clamp01((p_success + 1.0) / (max(p_clicks, p_success) + 3.0))
+
+        if clicks <= 0 and successes <= 0:
+            global_conversion = 0.35
+        else:
+            global_conversion = clamp01((successes + 1.0) / (max(clicks, successes) + 5.0))
+
+        reliability = clamp01((successes + 2.0) / (successes + reversals + 4.0))
+        payout_score = clamp01(__import__("math").log1p(max(0, candidate["payout_points"])) / max_payout_log)
+        compatibility = clamp01((candidate["device_compatibility"] + candidate["country_compatibility"]) / 2.0)
+        recency = _recency_score(candidate.get("last_seen_at") or candidate.get("last_synced_at"))
+        exposure = float(clicks + successes) / float(max_exposure)
+        discovery = clamp01(1.0 - exposure)
+
+        components = {
+            "personal_provider_conversion": round(personal_provider_conversion, 4),
+            "global_offer_conversion": round(global_conversion, 4),
+            "credit_reliability": round(reliability, 4),
+            "payout": round(payout_score, 4),
+            "country_device_compatibility": round(compatibility, 4),
+            "live_recency": round(recency, 4),
+            "discovery": round(discovery, 4),
+        }
+
+        weighted_score = (
+            0.25 * personal_provider_conversion
+            + 0.20 * global_conversion
+            + 0.15 * reliability
+            + 0.15 * payout_score
+            + 0.10 * compatibility
+            + 0.10 * recency
+            + 0.05 * discovery
+        )
+
+        penalties = {
+            "reversal": round(min(0.20, reversal_ratio * 0.25), 4),
+            "tickets": round(min(0.15, ticket_ratio * 0.20), 4),
+            "clicks_without_conversion": round(min(0.10, abandonment_ratio * 0.10), 4),
+            "already_started": 0.08 if metric["personal_started"] else 0.0,
+            "personal_ticket": 0.07 if metric["personal_ticket"] else 0.0,
+            "catalog_unconfirmed": 0.30 if not candidate["catalog_confirmed"] else 0.0,
+        }
+        total_penalty = sum(float(value) for value in penalties.values())
+        final_score = clamp01(weighted_score - total_penalty)
+
+        explanation: list[str] = []
+        if personal_provider_conversion >= 0.65:
+            explanation.append("Ce prestataire te réussit")
+        if global_conversion >= 0.55:
+            explanation.append("Bon taux de conversion global")
+        if reliability >= 0.75:
+            explanation.append("Créditation fiable")
+        if payout_score >= 0.75:
+            explanation.append("Récompense élevée")
+        if discovery >= 0.80:
+            explanation.append("Offre à découvrir")
+        if metric["personal_started"]:
+            explanation.append("Déjà commencée : score réduit")
+        if ticket_count > 0 or reversals > 0:
+            explanation.append("Qualité ajustée selon les incidents")
+        if not explanation:
+            explanation.append("Compatible avec ton profil et ton appareil")
+
+        scored.append(
+            {
+                "offer_id": candidate["offer_id"],
+                "provider": candidate["provider"],
+                "title": candidate["title"],
+                "payout_points": candidate["payout_points"],
+                "score": round(final_score, 4),
+                "reason": " • ".join(explanation[:2]),
+                "explanation": explanation,
+                "score_components": components,
+                "penalties": penalties,
+                "catalog_confirmed": candidate["catalog_confirmed"],
+                "admin_position": candidate["position"],
+            }
+        )
+
+    if not scored:
+        return []
+
+    scored.sort(
+        key=lambda item: (
+            float(item.get("score", 0.0)),
+            safe_int(item.get("payout_points"), 0),
+            -safe_int(item.get("admin_position"), 999999),
+        ),
+        reverse=True,
+    )
+
+    target_count = min(limit_int, len(scored))
+    exploration_rate = _env_float("IA_RECOMMENDATION_EXPLORATION_RATE", 0.15, 0.0, 0.35)
+    exploration_count = int(round(target_count * exploration_rate))
+    if target_count >= 6 and exploration_rate > 0 and exploration_count < 1:
+        exploration_count = 1
+    exploration_count = min(exploration_count, max(0, target_count - 1))
+    exploitation_count = target_count - exploration_count
+
+    selected = []
+    for item in scored[:exploitation_count]:
+        item = dict(item)
+        item["selection_type"] = "exploitation"
+        selected.append(item)
+
+    remaining = [dict(item) for item in scored[exploitation_count:]]
+    day_key = now.strftime("%Y-%m-%d")
+    seed = int(hashlib.sha256(f"{user_id}:{day_key}:discovery".encode("utf-8")).hexdigest()[:16], 16)
+    rng = random.Random(seed)
+    rng.shuffle(remaining)
+    remaining.sort(
+        key=lambda item: (
+            float((item.get("score_components") or {}).get("discovery", 0.0)),
+            float(item.get("score", 0.0)),
+        ),
+        reverse=True,
+    )
+    for item in remaining[:exploration_count]:
+        item["selection_type"] = "exploration"
+        selected.append(item)
+
+    run_id = str(uuid.uuid4())
+    for rank, item in enumerate(selected, start=1):
+        item["rank"] = rank
+        item["recommendation_run_id"] = run_id
+        item["algorithm_version"] = RECOMMENDATION_ALGORITHM_VERSION
+
+    _record_recommendation_decisions(
+        user_id=user_id,
+        run_id=run_id,
+        items=selected,
+        country=target_country,
+        device=target_device,
+    )
+    return selected
 
 
-@app.get("/recommendations/{user_id}")
-def get_recommendations(
+def _recommendations_payload(
     user_id: str,
-    limit: int = 10,
-    country: str | None = None,
-    device: str | None = None,
-):
+    limit: int,
+    country: str | None,
+    device: str | None,
+) -> dict:
     startup_error = resources.get("startup_error")
     if startup_error:
         raise HTTPException(status_code=500, detail=startup_error)
@@ -3281,23 +4005,11 @@ def get_recommendations(
             "reason": "balanced",
         }
 
-    try:
-        limit_int = max(1, safe_int(limit, 10))
-    except Exception:
-        limit_int = 10
-
+    limit_int = max(1, min(safe_int(limit, 10), 50))
     surveys_weight = float(mix.get("surveys_weight", 0.5))
     offers_weight = float(mix.get("offers_weight", 0.5))
-
-    offers_limit = int(round(float(limit_int) * float(offers_weight)))
-    if offers_limit < 3:
-        offers_limit = 3
-
-    surveys_limit = int(round(4.0 * float(surveys_weight)))
-    if surveys_limit < 1:
-        surveys_limit = 1
-    if surveys_limit > 4:
-        surveys_limit = 4
+    offers_limit = max(3, int(round(float(limit_int) * offers_weight)))
+    surveys_limit = max(1, min(4, int(round(4.0 * surveys_weight))))
 
     try:
         items = recommend_offers_internal(
@@ -3320,18 +4032,33 @@ def get_recommendations(
     except Exception:
         iframes = _iframe_provider_fallback(3)
 
-    return {"user_id": user_id, "items": items, "surveys": surveys, "iframes": iframes, "mix": mix}
+    return {
+        "user_id": user_id,
+        "items": items,
+        "surveys": surveys,
+        "iframes": iframes,
+        "mix": mix,
+        "algorithm_version": RECOMMENDATION_ALGORITHM_VERSION,
+    }
 
 
-# NEW primary endpoint: /personalization
-@app.get("/personalization/{user_id}")
-def get_personalization(
+def _personalization_payload(
     user_id: str,
-    limit: int = 10,
-    country: str | None = None,
-    device: str | None = None,
-):
+    limit: int,
+    country: str | None,
+    device: str | None,
+) -> dict:
     startup_error = resources.get("startup_error")
+    limit_int = max(1, min(safe_int(limit, 10), 50))
+    cache_key = _personalization_cache_key(
+        user_id=user_id,
+        limit_int=limit_int,
+        country=country,
+        device=device,
+    )
+    cached = _personalization_cache_get(cache_key)
+    if cached:
+        return cached
 
     try:
         mix = compute_mix(user_id=user_id)
@@ -3344,29 +4071,10 @@ def get_personalization(
             "reason": "balanced",
         }
 
-    try:
-        limit_int = max(1, safe_int(limit, 10))
-    except Exception:
-        limit_int = 10
-
-    cache_key = _personalization_cache_key(user_id=user_id, limit_int=limit_int, country=country, device=device)
-    cached = _personalization_cache_get(cache_key)
-    if cached:
-        return cached
-
     offers_weight = float(mix.get("offers_weight", 0.5))
     surveys_weight = float(mix.get("surveys_weight", 0.5))
-
-    offers_limit = int(round(float(limit_int) * float(offers_weight)))
-    if offers_limit < 3:
-        offers_limit = 3
-
-    surveys_limit = int(round(4.0 * float(surveys_weight)))
-    if surveys_limit < 2:
-        surveys_limit = 2
-
-    offerwalls_limit = 3
-    iframes_limit = 3
+    offers_limit = max(3, int(round(float(limit_int) * offers_weight)))
+    surveys_limit = max(2, int(round(4.0 * surveys_weight)))
 
     offers: list[dict] = []
     if not startup_error:
@@ -3384,10 +4092,8 @@ def get_personalization(
     try:
         now = datetime.now(timezone.utc)
         month_key = now.strftime("%Y-%m")
-        h = int(hashlib.sha256(f"{user_id}:{month_key}:offer-push".encode("utf-8")).hexdigest()[:12], 16)
-        d1 = min(28, 3 + (h % 6))
-        d2 = min(28, 17 + ((h // 7) % 6))
-        push_days = {d1, d2}
+        digest = int(hashlib.sha256(f"{user_id}:{month_key}:offer-push".encode("utf-8")).hexdigest()[:12], 16)
+        push_days = {min(28, 3 + (digest % 6)), min(28, 17 + ((digest // 7) % 6))}
         if offers and now.day in push_days:
             mix = dict(mix or {})
             mix["reason"] = "offer-heavy"
@@ -3400,16 +4106,14 @@ def get_personalization(
         surveys = recommend_survey_providers(user_id=user_id, limit=surveys_limit, mix=mix)
     except Exception:
         surveys = _survey_provider_fallback(surveys_limit)
-
     try:
-        offerwalls = recommend_offerwall_providers(user_id=user_id, limit=offerwalls_limit, mix=mix, device=device)
+        offerwalls = recommend_offerwall_providers(user_id=user_id, limit=3, mix=mix, device=device)
     except Exception:
-        offerwalls = _offerwall_provider_fallback(offerwalls_limit)
-
+        offerwalls = _offerwall_provider_fallback(3)
     try:
-        iframes = recommend_iframe_providers(user_id=user_id, limit=iframes_limit, mix=mix)
+        iframes = recommend_iframe_providers(user_id=user_id, limit=3, mix=mix)
     except Exception:
-        iframes = _iframe_provider_fallback(iframes_limit)
+        iframes = _iframe_provider_fallback(3)
 
     out = {
         "user_id": user_id,
@@ -3420,36 +4124,161 @@ def get_personalization(
             "iframes": iframes,
         },
         "offers": offers,
+        "recommendation_run_id": offers[0].get("recommendation_run_id") if offers else None,
+        "algorithm_version": RECOMMENDATION_ALGORITHM_VERSION,
     }
     _personalization_cache_set(cache_key, out)
     return out
 
 
-@app.get("/survey-recommendations/{user_id}")
-def get_survey_recommendations(user_id: str, limit: int = 4):
+@app.get("/recommendations")
+def get_my_recommendations(
+    request: Request,
+    limit: int = 10,
+    country: str | None = None,
+    device: str | None = None,
+    target_user_id: str | None = None,
+):
+    auth = _resolve_recommendation_user(request, target_user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "recommendations")
+    return _recommendations_payload(auth["target_user_id"], limit, country, device)
+
+
+@app.get("/personalization")
+def get_my_personalization(
+    request: Request,
+    limit: int = 10,
+    country: str | None = None,
+    device: str | None = None,
+    target_user_id: str | None = None,
+):
+    auth = _resolve_recommendation_user(request, target_user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "personalization")
+    return _personalization_payload(auth["target_user_id"], limit, country, device)
+
+
+@app.get("/survey-recommendations")
+def get_my_survey_recommendations(
+    request: Request,
+    limit: int = 4,
+    target_user_id: str | None = None,
+):
+    auth = _resolve_recommendation_user(request, target_user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "survey-recommendations")
     try:
-        items = _compute_survey_provider_recommendations(user_id=user_id, limit=limit)
+        items = _compute_survey_provider_recommendations(user_id=auth["target_user_id"], limit=limit)
     except Exception:
         items = _survey_provider_fallback(limit)
-    return {"user_id": user_id, "items": items}
+    return {"user_id": auth["target_user_id"], "items": items}
+
+
+@app.get("/iframe-recommendations")
+def get_my_iframe_recommendations(
+    request: Request,
+    limit: int = 3,
+    target_user_id: str | None = None,
+):
+    auth = _resolve_recommendation_user(request, target_user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "iframe-recommendations")
+    try:
+        items = _compute_iframe_provider_recommendations(user_id=auth["target_user_id"], limit=limit)
+    except Exception:
+        items = _iframe_provider_fallback(limit)
+    return {"user_id": auth["target_user_id"], "items": items}
+
+
+@app.get("/offerwall-provider-recommendations")
+def get_my_offerwall_provider_recommendations(
+    request: Request,
+    limit: int = 3,
+    device: str | None = None,
+    target_user_id: str | None = None,
+):
+    auth = _resolve_recommendation_user(request, target_user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "offerwall-recommendations")
+    try:
+        items = _compute_offerwall_provider_recommendations(
+            user_id=auth["target_user_id"],
+            limit=limit,
+            device=device,
+        )
+    except Exception:
+        items = _offerwall_provider_fallback(limit)
+    return {"user_id": auth["target_user_id"], "items": items}
+
+
+# Routes historiques conservées pour éviter de casser un ancien frontend.
+# Elles sont désormais soumises au même JWT et au contrôle admin.
+@app.get("/recommendations/{user_id}")
+def get_recommendations_legacy(
+    user_id: str,
+    request: Request,
+    limit: int = 10,
+    country: str | None = None,
+    device: str | None = None,
+):
+    auth = _resolve_recommendation_user(request, user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "recommendations")
+    out = _recommendations_payload(auth["target_user_id"], limit, country, device)
+    out["deprecated_route"] = True
+    return out
+
+
+@app.get("/personalization/{user_id}")
+def get_personalization_legacy(
+    user_id: str,
+    request: Request,
+    limit: int = 10,
+    country: str | None = None,
+    device: str | None = None,
+):
+    auth = _resolve_recommendation_user(request, user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "personalization")
+    out = _personalization_payload(auth["target_user_id"], limit, country, device)
+    out["deprecated_route"] = True
+    return out
+
+
+@app.get("/survey-recommendations/{user_id}")
+def get_survey_recommendations_legacy(user_id: str, request: Request, limit: int = 4):
+    auth = _resolve_recommendation_user(request, user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "survey-recommendations")
+    try:
+        items = _compute_survey_provider_recommendations(user_id=auth["target_user_id"], limit=limit)
+    except Exception:
+        items = _survey_provider_fallback(limit)
+    return {"user_id": auth["target_user_id"], "items": items, "deprecated_route": True}
 
 
 @app.get("/iframe-recommendations/{user_id}")
-def get_iframe_recommendations(user_id: str, limit: int = 3):
+def get_iframe_recommendations_legacy(user_id: str, request: Request, limit: int = 3):
+    auth = _resolve_recommendation_user(request, user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "iframe-recommendations")
     try:
-        items = _compute_iframe_provider_recommendations(user_id=user_id, limit=limit)
+        items = _compute_iframe_provider_recommendations(user_id=auth["target_user_id"], limit=limit)
     except Exception:
         items = _iframe_provider_fallback(limit)
-    return {"user_id": user_id, "items": items}
+    return {"user_id": auth["target_user_id"], "items": items, "deprecated_route": True}
 
 
 @app.get("/offerwall-provider-recommendations/{user_id}")
-def get_offerwall_provider_recommendations(user_id: str, limit: int = 3, device: str | None = None):
+def get_offerwall_provider_recommendations_legacy(
+    user_id: str,
+    request: Request,
+    limit: int = 3,
+    device: str | None = None,
+):
+    auth = _resolve_recommendation_user(request, user_id)
+    _enforce_recommendation_rate_limit(auth["actor_user_id"], "offerwall-recommendations")
     try:
-        items = _compute_offerwall_provider_recommendations(user_id=user_id, limit=limit, device=device)
+        items = _compute_offerwall_provider_recommendations(
+            user_id=auth["target_user_id"],
+            limit=limit,
+            device=device,
+        )
     except Exception:
         items = _offerwall_provider_fallback(limit)
-    return {"user_id": user_id, "items": items}
+    return {"user_id": auth["target_user_id"], "items": items, "deprecated_route": True}
 
 
 @app.get("/offer-progress-notifications")
